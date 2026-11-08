@@ -12,7 +12,7 @@ Each CPU core runs its own monoio runtime with its own TCP and UDP listeners. Th
 ## Requirements
 
 - Linux with io_uring support (kernel 5.6+)
-- Rust nightly (pinned via `rust-toolchain.toml`)
+- Rust 1.88+ (stable)
 
 ## Getting started
 
