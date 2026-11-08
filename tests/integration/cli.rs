@@ -1,3 +1,5 @@
+//! Startup: CLI flags, bind failures and the cert file.
+
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
 
 use crate::util::{ServerCommand, bin};

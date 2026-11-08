@@ -1,3 +1,5 @@
+//! QUIC echo through a quinn client.
+
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use quinn::{Endpoint, crypto::rustls::QuicClientConfig};

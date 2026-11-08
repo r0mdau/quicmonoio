@@ -1,8 +1,5 @@
-//! A simple QUIC client to test the echo server.
-//!
-//! Usage:
-//!   cargo run --example quic_client                        # sends "Hello QUIC!"
-//!   cargo run --example quic_client -- "custom message"    # sends custom text
+//! QUIC echo test client: `cargo run --example quic_client [-- "message"]`.
+//! Connects to 127.0.0.1:4433 and trusts the cert the server wrote to `./.test-cert.der`.
 
 use std::sync::Arc;
 
@@ -18,7 +15,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .unwrap_or_else(|| "Hello QUIC!".to_string());
 
-    // Load the server's self-signed certificate from the local directory
     let cert_path = std::env::current_dir().unwrap().join(".test-cert.der");
     let cert_der = std::fs::read(&cert_path).map_err(|e| {
         format!(
@@ -42,25 +38,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
     endpoint.set_default_client_config(client_config);
 
-    // Connect to the server
     println!("Connecting to {SERVER_ADDR}...");
     let connection = endpoint.connect(SERVER_ADDR.parse()?, SERVER_NAME)?.await?;
     println!("Connected!");
 
-    // Open a bidirectional stream
     let (mut send, mut recv) = connection.open_bi().await?;
 
-    // Send the message
     println!("Sending: {message}");
     send.write_all(message.as_bytes()).await?;
     send.finish()?;
 
-    // Read the echoed response
     let response = recv.read_to_end(64 * 1024).await?;
     let response_str = String::from_utf8_lossy(&response);
     println!("Received echo: {response_str}");
 
-    // Close gracefully
+    // wait_idle lets the CONNECTION_CLOSE go out before the process exits.
     connection.close(0u32.into(), b"done");
     endpoint.wait_idle().await;
 

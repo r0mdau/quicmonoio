@@ -1,3 +1,5 @@
+//! Spawning the server binary on free ports, and a minimal HTTP client.
+
 use std::{
     collections::BTreeSet,
     fs::File,

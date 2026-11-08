@@ -1,4 +1,5 @@
 //! QUIC echo server: one `quinn_proto::Endpoint` + `UdpSocket` per core.
+//! quinn-proto does no I/O or timekeeping itself; [`run_quic_on_core`] drives it by hand.
 
 use std::{collections::HashMap, net::SocketAddr, path::Path, sync::Arc, time::Instant};
 
@@ -67,6 +68,7 @@ async fn flush_transmits(
     now: Instant,
 ) {
     let mut buf = Vec::new();
+    // One datagram per transmit: no GSO.
     while let Some(transmit) = conn.poll_transmit(now, 1, &mut buf) {
         udp_send(socket, &buf[..transmit.size], transmit.destination).await;
         buf.clear();
@@ -81,8 +83,8 @@ pub async fn run_quic_on_core(
     let mut endpoint = Endpoint::new(
         Arc::new(EndpointConfig::default()),
         Some(server_config),
-        true,
-        None,
+        true, // allow_mtud
+        None, // rng_seed
     );
     let mut connections: HashMap<ConnectionHandle, quinn::Connection> =
         HashMap::new();
@@ -90,6 +92,7 @@ pub async fn run_quic_on_core(
     let mut scratch_buf = Vec::new();
 
     loop {
+        // monoio moves the buffer into the operation and hands it back with the result.
         let (result, buf) = socket.recv_from(recv_buf).await;
         recv_buf = buf;
         let (n, remote) = match result {
@@ -141,6 +144,7 @@ pub async fn run_quic_on_core(
     }
 }
 
+/// One write + finish: data arriving later on the stream is not echoed.
 fn echo(core: usize, conn: &mut quinn::Connection, id: StreamId, data: &[u8]) {
     let mut send = conn.send_stream(id);
     match send.write(data) {
@@ -181,10 +185,12 @@ fn drain_app_events(
                 log::debug!("[core {core}] handshake complete");
                 continue;
             }
+            // The connection is never removed from `connections`.
             Event::ConnectionLost { reason } => {
                 log::debug!("[core {core}] connection lost: {reason}");
                 continue;
             }
+            // `Opened` may cover several streams, but only one is accepted per event.
             Event::Stream(StreamEvent::Opened { dir: Dir::Bi }) => {
                 match conn.streams().accept(Dir::Bi) {
                     Some(id) => id,

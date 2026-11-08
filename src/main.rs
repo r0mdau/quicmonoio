@@ -1,3 +1,5 @@
+//! Thread-per-core HTTP + QUIC server: one CPU-pinned monoio (io_uring) runtime per core.
+
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -47,6 +49,7 @@ fn run(config: Config) -> anyhow::Result<()> {
         "Starting {thread_count} cores: HTTP on {http_addr}, QUIC on {quic_addr}"
     );
 
+    // One cert for all cores: the kernel may route a client to any of them.
     let quic_config = quic::make_server_config(&config.cert_path)?;
 
     // Cores serve forever, so the first one to report back (error or panic)

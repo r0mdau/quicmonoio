@@ -1,3 +1,5 @@
+//! Command-line flags.
+
 use std::{net::SocketAddr, num::NonZeroUsize, path::PathBuf};
 
 use clap::Parser;

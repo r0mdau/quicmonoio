@@ -1,3 +1,5 @@
+//! HTTP routes over a real TCP connection.
+
 use crate::util::{Server, http_request};
 
 #[test]
