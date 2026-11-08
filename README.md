@@ -1,0 +1,86 @@
+# quicmonoio
+
+A thread-per-core HTTP + QUIC server built on [monoio](https://github.com/bytedance/monoio) (io_uring) and [quinn-proto](https://github.com/quinn-rs/quinn).
+
+Each CPU core runs its own monoio runtime with its own TCP and UDP listeners. No state is shared between threads.
+
+| Protocol | Transport | Port | Engine |
+|----------|-----------|------|--------|
+| HTTP     | TCP       | 8080 | monoio `TcpListener` |
+| QUIC     | UDP       | 4433 | quinn-proto state machine + monoio `UdpSocket` |
+
+## Requirements
+
+- Linux with io_uring support (kernel 5.6+)
+- Rust nightly (pinned via `rust-toolchain.toml`)
+
+## Getting started
+
+### 1. Start the server
+
+```bash
+cargo run
+```
+
+### 2. Test HTTP
+
+```bash
+curl http://127.0.0.1:8080/           # HTML welcome page
+curl http://127.0.0.1:8080/health     # {"status":"ok"}
+```
+
+### 3. Test QUIC
+
+A bundled echo client makes this as easy as using curl:
+
+```bash
+cargo run --bin quic_client                            # sends "Hello QUIC!"
+cargo run --bin quic_client -- "your message here"     # custom message
+```
+
+Example output:
+
+```
+Connecting to 127.0.0.1:4433...
+Connected!
+Sending: Hello QUIC!
+Received echo: Hello QUIC!
+```
+
+### Makefile shortcuts
+
+```bash
+make build              # release build of server + client
+make run                # start the server
+make client MSG="hi"    # QUIC echo against a running server
+make test               # cargo test + end-to-end HTTP/QUIC check on a fresh server
+make clean              # cargo clean + remove the generated cert
+```
+
+## How it works
+
+- At startup the server generates a **self-signed TLS certificate** and writes it to `./.test-cert.der`.
+- The test client loads that certificate from the same directory, so no manual setup is needed. Run both from the project root.
+- Every core binds `:8080` (TCP) and `:4433` (UDP) with `SO_REUSEPORT`, and the kernel spreads incoming traffic across them.
+- On the server, QUIC runs on `quinn-proto`, a runtime-agnostic state machine, driven entirely by monoio's event loop. The server does not use tokio; only the test client does.
+
+## Design: why run both protocols on every core?
+
+HTTP and QUIC both run on **every** core. The alternative would be a static split, for example half the cores for HTTP and half for QUIC:
+
+- **Better utilization**: when one protocol is idle, its cores still serve the other instead of sitting unused.
+- **No tuning**: a static split means guessing a ratio, and the right ratio depends on the workload.
+- **No interference**: each core has its own `TcpListener`, `UdpSocket` and `quinn_proto::Endpoint`, so the two protocols never compete for shared state.
+
+A split would only pay off if one protocol used enough CPU to starve the other's event loop.
+
+## jemalloc
+
+The global allocator is [jemalloc](https://github.com/tikv/jemallocator). jemalloc gives each thread its own arena, which suits a thread-per-core design: every core allocates from its own pool without lock contention.
+
+- **When it helps:** high concurrency (thousands of connections), many small allocations per request, and long-running processes where glibc malloc tends to fragment memory.
+- **When it doesn't:** low traffic, or I/O-bound workloads where the allocator isn't the bottleneck.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).

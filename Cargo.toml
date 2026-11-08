@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+
+[package]
+name = "quicmonoio"
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+default-run = "quicmonoio"
+
+[dependencies]
+tikv-jemallocator = "0.6"
+monoio = "0.2"
+quinn-proto = "0.11"
+bytes = "1"
+socket2 = "0.5"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.13"
+rustls-pki-types = "1"
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+
+# Client-only deps (the test client uses high-level quinn + tokio)
+quinn = "0.11"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+rlimit = "0.11.0"

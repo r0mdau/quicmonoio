@@ -1,0 +1,11 @@
+# Rust build output
+/target/
+
+# Generated at runtime by the server (self-signed QUIC cert)
+.test-cert.der
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
