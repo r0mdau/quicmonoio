@@ -146,10 +146,12 @@ async fn quic_retransmits_lost_echo() {
             let is_echo = dir == Direction::ToClient
                 && (MESSAGE.len()..MESSAGE.len() + 100)
                     .contains(&datagram.len());
-            !is_echo
-                || to_drop
-                    .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
-                    .is_err()
+            let remaining = to_drop.load(SeqCst);
+            if is_echo && remaining > 0 {
+                to_drop.store(remaining - 1, SeqCst);
+                return false;
+            }
+            true
         })
         .await
     };
