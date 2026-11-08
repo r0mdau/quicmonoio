@@ -4,7 +4,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering::SeqCst},
+        atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst},
     },
     time::Duration,
 };
@@ -265,6 +265,35 @@ async fn quic_retransmits_lost_echo() {
 
     assert_eq!(reply, MESSAGE);
     assert_eq!(to_drop.load(SeqCst), 0, "no echo was lost");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quic_echo_resumes_through_periodic_loss() {
+    const DROP_EVERY: usize = 20;
+
+    let server = Server::start("quic_echo_resumes_through_periodic_loss");
+    let lossy = Arc::new(AtomicBool::new(false));
+    let to_client = Arc::new(AtomicUsize::new(0));
+    let proxy = {
+        let (lossy, to_client) = (lossy.clone(), to_client.clone());
+        LossyProxy::start(server.quic_addr(), move |dir, _| {
+            dir != Direction::ToClient
+                || !lossy.load(SeqCst)
+                || (to_client.fetch_add(1, SeqCst) + 1) % DROP_EVERY != 0
+        })
+        .await
+    };
+    let endpoint = client_endpoint(std::fs::read(server.cert_path()).unwrap());
+
+    let conn = connect(&endpoint, proxy.addr()).await;
+    lossy.store(true, SeqCst);
+    let message = pattern(256 * 1024, 0);
+    let reply = timeout(TEST_TIMEOUT, echo_on(&conn, &message))
+        .await
+        .expect("echo stalled under loss");
+
+    assert!(reply == message, "echo differs from the message");
+    assert!(to_client.load(SeqCst) >= DROP_EVERY, "no datagram was lost");
 }
 
 #[tokio::test]
