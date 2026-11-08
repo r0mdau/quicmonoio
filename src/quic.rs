@@ -1,6 +1,6 @@
 //! QUIC echo server: one `quinn_proto::Endpoint` + `UdpSocket` per core.
 
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Instant};
+use std::{collections::HashMap, net::SocketAddr, path::Path, sync::Arc, time::Instant};
 
 use anyhow::Context;
 use bytes::BytesMut;
@@ -12,24 +12,19 @@ use quinn_proto::{
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 
-pub const QUIC_ADDR: &str = "0.0.0.0:4433";
-
-/// Read by the test client from the working directory.
-const CERT_FILE: &str = ".test-cert.der";
-
 /// Builds the config shared by all cores, with a fresh self-signed cert
-/// written to `./.test-cert.der`.
-pub fn make_server_config() -> anyhow::Result<Arc<ServerConfig>> {
+/// written to `cert_path` for the test client.
+pub fn make_server_config(cert_path: &Path) -> anyhow::Result<Arc<ServerConfig>> {
     let cert_key = generate_simple_self_signed(vec!["localhost".into()])
         .context("failed to generate self-signed certificate")?;
     let cert_der = CertificateDer::from(cert_key.cert);
     let key_der = PrivatePkcs8KeyDer::from(cert_key.key_pair.serialize_der());
 
     // Unlink first: an old file owned by another user can't be overwritten.
-    let _ = std::fs::remove_file(CERT_FILE);
-    match std::fs::write(CERT_FILE, &cert_der) {
-        Ok(()) => log::info!("Self-signed cert written to {CERT_FILE}"),
-        Err(e) => log::warn!("Could not write {CERT_FILE}: {e}"),
+    let _ = std::fs::remove_file(cert_path);
+    match std::fs::write(cert_path, &cert_der) {
+        Ok(()) => log::info!("Self-signed cert written to {}", cert_path.display()),
+        Err(e) => log::warn!("Could not write {}: {e}", cert_path.display()),
     }
 
     let mut tls_config = rustls::ServerConfig::builder()
@@ -44,10 +39,9 @@ pub fn make_server_config() -> anyhow::Result<Arc<ServerConfig>> {
 }
 
 /// Binds a per-core UDP socket with SO_REUSEPORT. Needs a monoio runtime.
-pub fn bind_udp_socket() -> anyhow::Result<UdpSocket> {
-    let addr: SocketAddr = QUIC_ADDR.parse()?;
+pub fn bind_udp_socket(addr: SocketAddr) -> anyhow::Result<UdpSocket> {
     let sock = socket2::Socket::new(
-        socket2::Domain::IPV4,
+        socket2::Domain::for_address(addr),
         socket2::Type::DGRAM,
         Some(socket2::Protocol::UDP),
     )?;

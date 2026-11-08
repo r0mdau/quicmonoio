@@ -2,6 +2,7 @@
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use std::{
+    net::SocketAddr,
     num::NonZeroUsize,
     panic::{self, AssertUnwindSafe},
     process::ExitCode,
@@ -10,6 +11,7 @@ use std::{
 };
 
 use anyhow::{Context, bail};
+use clap::Parser;
 use monoio::{
     io::{AsyncReadRent, AsyncWriteRentExt},
     net::{ListenerOpts, TcpListener},
@@ -17,14 +19,16 @@ use monoio::{
     IoUringDriver,
 };
 
+mod cli;
 mod quic;
 
-const ADDR: &str = "0.0.0.0:8080";
+use cli::Config;
 
 fn main() -> ExitCode {
+    let config = Config::parse();
     let env = env_logger::Env::default().default_filter_or("info");
     env_logger::Builder::from_env(env).init();
-    match run() {
+    match run(config) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("Error: {err:?}");
@@ -33,14 +37,17 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> anyhow::Result<()> {
-    let thread_count = available_parallelism().map_or(1, NonZeroUsize::get);
+fn run(config: Config) -> anyhow::Result<()> {
+    let thread_count = config
+        .threads
+        .or_else(|| available_parallelism().ok())
+        .map_or(1, NonZeroUsize::get);
+    let Config { http_addr, quic_addr, .. } = config;
     log::info!(
-        "Starting {thread_count} cores: HTTP on {ADDR}, QUIC on {}",
-        quic::QUIC_ADDR
+        "Starting {thread_count} cores: HTTP on {http_addr}, QUIC on {quic_addr}"
     );
 
-    let quic_config = quic::make_server_config()?;
+    let quic_config = quic::make_server_config(&config.cert_path)?;
 
     // Cores serve forever, so the first one to report back (error or panic)
     // is fatal.
@@ -51,7 +58,7 @@ fn run() -> anyhow::Result<()> {
             .name(format!("core-{core}"))
             .spawn(move || {
                 let res = panic::catch_unwind(AssertUnwindSafe(|| {
-                    run_core(core, quic_config)
+                    run_core(core, http_addr, quic_addr, quic_config)
                 }));
                 let _ = tx.send((core, res));
             })
@@ -69,6 +76,8 @@ fn run() -> anyhow::Result<()> {
 
 fn run_core(
     core: usize,
+    http_addr: SocketAddr,
+    quic_addr: SocketAddr,
     quic_config: Arc<quinn_proto::ServerConfig>,
 ) -> anyhow::Result<()> {
     bind_to_cpu_set([core])
@@ -77,17 +86,19 @@ fn run_core(
         .enable_timer()
         .build()
         .context("failed to build io_uring runtime")?
-        .block_on(serve(core, quic_config))
+        .block_on(serve(core, http_addr, quic_addr, quic_config))
 }
 
 async fn serve(
     core: usize,
+    http_addr: SocketAddr,
+    quic_addr: SocketAddr,
     quic_config: Arc<quinn_proto::ServerConfig>,
 ) -> anyhow::Result<()> {
-    let quic_socket = quic::bind_udp_socket()?;
+    let quic_socket = quic::bind_udp_socket(quic_addr)?;
     let opts = ListenerOpts::default().reuse_port(true).reuse_addr(true);
-    let listener = TcpListener::bind_with_config(ADDR, &opts)
-        .with_context(|| format!("failed to bind HTTP listener on {ADDR}"))?;
+    let listener = TcpListener::bind_with_config(http_addr, &opts)
+        .with_context(|| format!("failed to bind HTTP listener on {http_addr}"))?;
 
     monoio::spawn(quic::run_quic_on_core(core, quic_config, quic_socket));
 
@@ -117,17 +128,22 @@ async fn handle_connection(
 
     let request = String::from_utf8_lossy(&buf[..n]);
     let (method, path) = parse_request_line(&request);
-    let (status, content_type, body) = match (method, path) {
-        ("GET", "/") => (200, "text/html", WELCOME_HTML),
-        ("GET", "/health") => (200, "application/json", r#"{"status":"ok"}"#),
-        _ => (404, "text/plain", "404 Not Found"),
-    };
+    let (status, content_type, body) = route(method, path);
     log::debug!("{method} {path} -> {status}");
 
     let response = build_response(status, content_type, body);
     let (res, _) = stream.write_all(response.into_bytes()).await;
     res?;
     Ok(())
+}
+
+/// (status, content type, body) for a request.
+fn route(method: &str, path: &str) -> (u16, &'static str, &'static str) {
+    match (method, path) {
+        ("GET", "/") => (200, "text/html", WELCOME_HTML),
+        ("GET", "/health") => (200, "application/json", r#"{"status":"ok"}"#),
+        _ => (404, "text/plain", "404 Not Found"),
+    }
 }
 
 /// Extract (method, path) from the first line of an HTTP request.
