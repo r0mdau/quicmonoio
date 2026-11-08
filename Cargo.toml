@@ -18,11 +18,11 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 
 [dev-dependencies]
-quinn = "0.11"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log", "bloom"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [profile.release]
-debug = 1 # symbols for perf/flamegraphs
+debug = 1
 
 # No panic = "abort": the per-core NotifyOnExit guard needs unwinding to report a core panic.
 [profile.release-lto]

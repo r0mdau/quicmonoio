@@ -59,7 +59,7 @@ make clean              # cargo clean + remove the generated cert
 
 ### Release profiles
 
-`cargo build --release` keeps line-level debug info so `perf` and flamegraphs can symbolize the binary. For a smaller, faster binary (fat LTO, one codegen unit, stripped), use `cargo build --profile release-lto`; the output lands in `target/release-lto/quicmonoio`.
+`--release` keeps debug info for `perf`/flamegraphs; `cargo build --profile release-lto` (or `make build PROFILE=release-lto`) builds an optimized, stripped binary.
 
 ## How it works
 
