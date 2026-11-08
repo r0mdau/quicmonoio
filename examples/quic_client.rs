@@ -1,8 +1,8 @@
 //! A simple QUIC client to test the echo server.
 //!
 //! Usage:
-//!   cargo run --bin quic_client                        # sends "Hello QUIC!"
-//!   cargo run --bin quic_client -- "custom message"    # sends custom text
+//!   cargo run --example quic_client                        # sends "Hello QUIC!"
+//!   cargo run --example quic_client -- "custom message"    # sends custom text
 
 use std::sync::Arc;
 

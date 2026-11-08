@@ -34,8 +34,8 @@ curl http://127.0.0.1:8080/health     # {"status":"ok"}
 A bundled echo client makes this as easy as using curl:
 
 ```bash
-cargo run --bin quic_client                            # sends "Hello QUIC!"
-cargo run --bin quic_client -- "your message here"     # custom message
+cargo run --example quic_client                        # sends "Hello QUIC!"
+cargo run --example quic_client -- "your message here" # custom message
 ```
 
 Example output:
@@ -56,6 +56,10 @@ make client MSG="hi"    # QUIC echo against a running server
 make test               # cargo test + end-to-end HTTP/QUIC check on a fresh server
 make clean              # cargo clean + remove the generated cert
 ```
+
+### Release profiles
+
+`cargo build --release` keeps line-level debug info so `perf` and flamegraphs can symbolize the binary. For a smaller, faster binary (fat LTO, one codegen unit, stripped), use `cargo build --profile release-lto`; the output lands in `target/release-lto/quicmonoio`.
 
 ## How it works
 

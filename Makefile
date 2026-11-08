@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 
 SERVER := target/release/quicmonoio
-CLIENT := target/release/quic_client
+CLIENT := target/release/examples/quic_client
 
 .PHONY: all build run client test clean
 
@@ -9,7 +9,7 @@ all: build
 
 ## build: compile server and client in release mode
 build:
-	cargo build --release
+	cargo build --release --bins --examples
 
 ## run: start the server (HTTP :8080, QUIC :4433)
 run: build
