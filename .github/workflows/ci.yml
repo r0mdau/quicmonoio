@@ -1,0 +1,146 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches:
+    - main
+  schedule:
+  - cron: '00 01 * * *'
+
+# Explicit permissions drop the write-all token granted on `schedule`.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.build }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUST_BACKTRACE: 1
+      # Overrides rust-toolchain.toml, which would otherwise win over the matrix toolchain.
+      RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - build: pinned
+          os: ubuntu-latest
+          # TODO(rebase): sync with `rust-version` in Cargo.toml.
+          rust: 1.88.0
+        - build: stable
+          os: ubuntu-latest
+          rust: stable
+        - build: nightly
+          os: ubuntu-latest
+          rust: nightly
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ matrix.rust }}
+
+    - name: Cache cargo artifacts
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ matrix.rust }}
+
+    - name: Show toolchain
+      run: |
+        rustup show active-toolchain
+        rustc --version --verbose
+        cargo --version
+
+    # The server has no non-io_uring fallback; fail clearly if the runner blocks it.
+    - name: Check io_uring availability
+      run: |
+        echo "kernel: $(uname -r)"
+        echo "memlock limit: $(ulimit -l)"
+        if [ -r /proc/sys/kernel/io_uring_disabled ]; then
+          echo "kernel.io_uring_disabled = $(cat /proc/sys/kernel/io_uring_disabled)"
+        fi
+        python3 - <<'PY'
+        import ctypes, errno, os, sys
+        libc = ctypes.CDLL(None, use_errno=True)
+        SYS_io_uring_setup = 425
+        params = ctypes.create_string_buffer(120)  # sizeof(struct io_uring_params)
+        fd = libc.syscall(SYS_io_uring_setup, 8, params)
+        if fd < 0:
+            e = ctypes.get_errno()
+            print(f"::error title=io_uring unavailable::io_uring_setup failed: "
+                  f"{errno.errorcode.get(e, e)} ({os.strerror(e)}). The server "
+                  f"requires io_uring; this runner cannot run the tests.")
+            sys.exit(1)
+        os.close(fd)
+        print("io_uring_setup OK")
+        PY
+
+    - name: Build
+      run: cargo build --verbose --all-targets
+
+    - name: Run tests
+      run: cargo test --verbose
+
+    - name: Run end-to-end tests
+      timeout-minutes: 10
+      run: make test
+
+  rustfmt:
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: stable
+        components: rustfmt
+    - name: Check formatting
+      run: cargo fmt --all --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: stable
+        components: clippy
+    - name: Cache cargo artifacts
+      uses: Swatinem/rust-cache@v2
+    - name: Run clippy
+      run: cargo clippy --all-targets --verbose -- -D warnings
+
+  docs:
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: stable
+    - name: Cache cargo artifacts
+      uses: Swatinem/rust-cache@v2
+    - name: Check documentation
+      env:
+        RUSTDOCFLAGS: -D warnings
+      run: cargo doc --no-deps --document-private-items
