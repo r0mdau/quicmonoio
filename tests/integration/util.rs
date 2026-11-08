@@ -242,11 +242,19 @@ fn http_get(addr: SocketAddr, path: &str) -> std::io::Result<Response> {
 }
 
 pub fn http_request(addr: SocketAddr, raw: &str) -> std::io::Result<Response> {
-    let mut stream = TcpStream::connect_timeout(&addr, IO_TIMEOUT)?;
+    let mut stream = connect(addr)?;
+    stream.write_all(raw.as_bytes())?;
+    read_response(&mut stream)
+}
+
+pub fn connect(addr: SocketAddr) -> std::io::Result<TcpStream> {
+    let stream = TcpStream::connect_timeout(&addr, IO_TIMEOUT)?;
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
-    stream.write_all(raw.as_bytes())?;
+    Ok(stream)
+}
 
+pub fn read_response(stream: &mut TcpStream) -> std::io::Result<Response> {
     let mut raw = String::new();
     stream.read_to_string(&mut raw)?;
     parse_response(&raw).ok_or_else(|| {
