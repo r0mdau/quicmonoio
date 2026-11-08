@@ -107,6 +107,7 @@ async fn serve(
             format!("failed to bind HTTP listener on {http_addr}")
         })?;
 
+    log::debug!("[core {core}] listening");
     monoio::spawn(quic::run_quic_on_core(core, quic_config, quic_socket));
 
     loop {

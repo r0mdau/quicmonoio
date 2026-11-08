@@ -100,8 +100,6 @@ The global allocator is [jemalloc](https://github.com/tikv/jemallocator). jemall
 
 ## Known limitations
 
-- **No QUIC timers**: `poll_timeout`/`handle_timeout` are never called, so there are no retransmissions of lost packets and no idle timeout.
-- **Connections leak**: closed QUIC connections are never removed from the per-core connection map.
 - **Echo is one-shot**: the server echoes the first read on each stream, then finishes it; partial writes are not retried.
 - **Streams can be missed**: one bidirectional stream is accepted per `Opened` event; unidirectional streams are ignored.
 - **Minimal HTTP**: a single read of up to 4 KiB, only `GET /` and `GET /health`, always `Connection: close`.
