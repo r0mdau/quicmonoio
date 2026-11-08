@@ -17,30 +17,22 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Overrides rust-toolchain.toml, which would otherwise win over the installed toolchain.
+  RUSTUP_TOOLCHAIN: stable
 
 jobs:
   test:
-    name: test (${{ matrix.build }})
+    name: test (${{ matrix.rust }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
       RUST_BACKTRACE: 1
-      # Overrides rust-toolchain.toml, which would otherwise win over the matrix toolchain.
       RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-        - build: pinned
-          os: ubuntu-latest
-          # TODO(rebase): sync with `rust-version` in Cargo.toml.
-          rust: 1.88.0
-        - build: stable
-          os: ubuntu-latest
-          rust: stable
-        - build: nightly
-          os: ubuntu-latest
-          rust: nightly
+        # TODO(rebase): sync the pinned version with `rust-version` in Cargo.toml.
+        rust: [1.88.0, stable, nightly]
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
@@ -52,14 +44,6 @@ jobs:
 
     - name: Cache cargo artifacts
       uses: Swatinem/rust-cache@v2
-      with:
-        key: ${{ matrix.rust }}
-
-    - name: Show toolchain
-      run: |
-        rustup show active-toolchain
-        rustc --version --verbose
-        cargo --version
 
     # The server has no non-io_uring fallback; fail clearly if the runner blocks it.
     - name: Check io_uring availability
@@ -97,8 +81,6 @@ jobs:
 
   rustfmt:
     runs-on: ubuntu-latest
-    env:
-      RUSTUP_TOOLCHAIN: stable
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
@@ -112,8 +94,6 @@ jobs:
 
   clippy:
     runs-on: ubuntu-latest
-    env:
-      RUSTUP_TOOLCHAIN: stable
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
@@ -129,8 +109,6 @@ jobs:
 
   docs:
     runs-on: ubuntu-latest
-    env:
-      RUSTUP_TOOLCHAIN: stable
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
