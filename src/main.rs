@@ -2,11 +2,11 @@
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use std::{
-    any::Any,
     num::NonZeroUsize,
+    panic::{self, AssertUnwindSafe},
     process::ExitCode,
     sync::{Arc, mpsc},
-    thread::{self, JoinHandle, available_parallelism},
+    thread::{self, available_parallelism},
 };
 
 use anyhow::{Context, bail};
@@ -22,12 +22,11 @@ mod quic;
 const ADDR: &str = "0.0.0.0:8080";
 
 fn main() -> ExitCode {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let env = env_logger::Env::default().default_filter_or("info");
+    env_logger::Builder::from_env(env).init();
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            // Printed directly (not via `log`) so a fatal error is never filtered out.
-            // `{:?}` on anyhow::Error prints the full "Caused by:" chain.
             eprintln!("Error: {err:?}");
             ExitCode::FAILURE
         }
@@ -36,108 +35,72 @@ fn main() -> ExitCode {
 
 fn run() -> anyhow::Result<()> {
     let thread_count = available_parallelism().map_or(1, NonZeroUsize::get);
-    log::info!("Starting server on {thread_count} threads (thread-per-core)");
-    log::info!("  HTTP: {ADDR} (TCP)");
-    log::info!("  QUIC: {} (UDP)", quic::QUIC_ADDR);
+    log::info!(
+        "Starting {thread_count} cores: HTTP on {ADDR}, QUIC on {}",
+        quic::QUIC_ADDR
+    );
 
-    // Generate the QUIC cert once, share it across all cores
-    let quic_config = quic::make_server_config().context("failed to build QUIC server config")?;
+    let quic_config = quic::make_server_config()?;
 
-    // Every core thread sends its id on this channel when it stops, whether it
-    // returned an error (e.g. a bind failure during setup) or panicked.
-    let (exit_tx, exit_rx) = mpsc::channel();
-    let mut threads = Vec::with_capacity(thread_count);
+    // Cores serve forever, so the first one to report back (error or panic)
+    // is fatal.
+    let (tx, rx) = mpsc::channel();
     for core in 0..thread_count {
-        threads.push(start_thread_on_core(core, quic_config.clone(), exit_tx.clone())?);
+        let (quic_config, tx) = (quic_config.clone(), tx.clone());
+        thread::Builder::new()
+            .name(format!("core-{core}"))
+            .spawn(move || {
+                let res = panic::catch_unwind(AssertUnwindSafe(|| {
+                    run_core(core, quic_config)
+                }));
+                let _ = tx.send((core, res));
+            })
+            .with_context(|| format!("failed to spawn thread for core {core}"))?;
     }
-    drop(exit_tx);
+    drop(tx);
 
-    // Core threads serve forever, so the first one to stop is a failure: report
-    // it and exit (which also tears down the remaining cores).
-    let core = exit_rx
-        .recv()
-        .context("all core threads stopped without reporting")?;
-    let thread = threads
-        .into_iter()
-        .nth(core)
-        .with_context(|| format!("unknown core id {core}"))?;
-    match thread.join() {
+    let (core, res) = rx.recv().context("all cores stopped")?;
+    match res {
         Ok(Ok(())) => bail!("core {core} stopped unexpectedly"),
         Ok(Err(err)) => Err(err.context(format!("core {core} failed"))),
-        Err(payload) => bail!("core {core} panicked: {}", panic_message(&*payload)),
+        Err(_) => bail!("core {core} panicked"),
     }
 }
 
-/// Notifies the main thread (with the core id) when dropped, i.e. when the core
-/// thread returns or unwinds from a panic.
-struct NotifyOnExit {
-    core: usize,
-    tx: mpsc::Sender<usize>,
-}
-
-impl Drop for NotifyOnExit {
-    fn drop(&mut self) {
-        // Only fails if main has stopped listening, in which case the process is exiting anyway.
-        let _ = self.tx.send(self.core);
-    }
-}
-
-fn panic_message(payload: &(dyn Any + Send)) -> &str {
-    payload
-        .downcast_ref::<&str>()
-        .copied()
-        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-        .unwrap_or("<non-string panic payload>")
-}
-
-fn start_thread_on_core(
+fn run_core(
     core: usize,
     quic_config: Arc<quinn_proto::ServerConfig>,
-    exit_tx: mpsc::Sender<usize>,
-) -> anyhow::Result<JoinHandle<anyhow::Result<()>>> {
-    thread::Builder::new()
-        .name(format!("core-{core}"))
-        .spawn(move || {
-            let _notify = NotifyOnExit { core, tx: exit_tx };
-
-            bind_to_cpu_set([core]).with_context(|| format!("failed to pin thread to CPU {core}"))?;
-
-            monoio::RuntimeBuilder::<IoUringDriver>::new()
-                .enable_timer()
-                .build()
-                .context("failed to build monoio io_uring runtime")?
-                .block_on(serve(core, quic_config))
-        })
-        .with_context(|| format!("failed to spawn thread for core {core}"))
+) -> anyhow::Result<()> {
+    bind_to_cpu_set([core])
+        .with_context(|| format!("failed to pin thread to CPU {core}"))?;
+    monoio::RuntimeBuilder::<IoUringDriver>::new()
+        .enable_timer()
+        .build()
+        .context("failed to build io_uring runtime")?
+        .block_on(serve(core, quic_config))
 }
 
-async fn serve(core: usize, quic_config: Arc<quinn_proto::ServerConfig>) -> anyhow::Result<()> {
-    // Bind both sockets before serving anything, so a setup failure is returned
-    // (and stops the process) instead of leaving this core half up.
-    let quic_socket = quic::bind_udp_socket()
-        .with_context(|| format!("failed to set up QUIC socket on {}", quic::QUIC_ADDR))?;
-
+async fn serve(
+    core: usize,
+    quic_config: Arc<quinn_proto::ServerConfig>,
+) -> anyhow::Result<()> {
+    let quic_socket = quic::bind_udp_socket()?;
     let opts = ListenerOpts::default().reuse_port(true).reuse_addr(true);
     let listener = TcpListener::bind_with_config(ADDR, &opts)
         .with_context(|| format!("failed to bind HTTP listener on {ADDR}"))?;
 
-    // Spawn QUIC server as a background task on this core
     monoio::spawn(quic::run_quic_on_core(core, quic_config, quic_socket));
-
-    log::info!("[core {core}] HTTP listening on {ADDR}");
 
     loop {
         match listener.accept().await {
             Ok((stream, addr)) => {
                 monoio::spawn(async move {
                     if let Err(e) = handle_connection(stream).await {
-                        log::warn!("[core {core}] Error handling {addr}: {e}");
+                        log::warn!("[core {core}] {addr}: {e}");
                     }
                 });
             }
-            Err(e) => {
-                log::warn!("[core {core}] Accept error: {e}");
-            }
+            Err(e) => log::warn!("[core {core}] accept failed: {e}"),
         }
     }
 }
@@ -145,33 +108,25 @@ async fn serve(core: usize, quic_config: Arc<quinn_proto::ServerConfig>) -> anyh
 async fn handle_connection(
     mut stream: monoio::net::TcpStream,
 ) -> std::io::Result<()> {
-    // Read the request (up to 4 KiB is enough for the first line)
-    let buf = Vec::with_capacity(4096);
-    let (res, buf) = stream.read(buf).await;
+    // 4 KiB is enough for the request line.
+    let (res, buf) = stream.read(Vec::with_capacity(4096)).await;
     let n = res?;
     if n == 0 {
         return Ok(());
     }
 
-    // Parse the request line: "METHOD /path HTTP/1.x\r\n..."
     let request = String::from_utf8_lossy(&buf[..n]);
     let (method, path) = parse_request_line(&request);
-
-    // Route
-    let (status, response) = match (method, path) {
-        ("GET", "/") => (200, build_response(200, "text/html", WELCOME_HTML)),
-        ("GET", "/health") => {
-            (200, build_response(200, "application/json", r#"{"status":"ok"}"#))
-        }
-        _ => (404, build_response(404, "text/plain", "404 Not Found")),
+    let (status, content_type, body) = match (method, path) {
+        ("GET", "/") => (200, "text/html", WELCOME_HTML),
+        ("GET", "/health") => (200, "application/json", r#"{"status":"ok"}"#),
+        _ => (404, "text/plain", "404 Not Found"),
     };
+    log::debug!("{method} {path} -> {status}");
 
-    let thread_id = std::thread::current().id();
-    log::debug!("[{thread_id:?}] {method} {path} -> {status}");
-
+    let response = build_response(status, content_type, body);
     let (res, _) = stream.write_all(response.into_bytes()).await;
     res?;
-
     Ok(())
 }
 
