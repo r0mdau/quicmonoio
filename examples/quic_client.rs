@@ -11,9 +11,8 @@ const SERVER_NAME: &str = "localhost";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let message = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "Hello QUIC!".to_string());
+    let message =
+        std::env::args().nth(1).unwrap_or_else(|| "Hello QUIC!".to_string());
 
     let cert_path = std::env::current_dir().unwrap().join(".test-cert.der");
     let cert_der = std::fs::read(&cert_path).map_err(|e| {
@@ -39,7 +38,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     endpoint.set_default_client_config(client_config);
 
     println!("Connecting to {SERVER_ADDR}...");
-    let connection = endpoint.connect(SERVER_ADDR.parse()?, SERVER_NAME)?.await?;
+    let connection =
+        endpoint.connect(SERVER_ADDR.parse()?, SERVER_NAME)?.await?;
     println!("Connected!");
 
     let (mut send, mut recv) = connection.open_bi().await?;

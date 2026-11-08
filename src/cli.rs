@@ -32,7 +32,9 @@ mod tests {
     use super::*;
 
     fn parse(args: &[&str]) -> Result<Config, clap::Error> {
-        Config::try_parse_from(std::iter::once("quicmonoio").chain(args.iter().copied()))
+        Config::try_parse_from(
+            std::iter::once("quicmonoio").chain(args.iter().copied()),
+        )
     }
 
     #[test]

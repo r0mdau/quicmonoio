@@ -1,7 +1,10 @@
 //! QUIC echo server: one `quinn_proto::Endpoint` + `UdpSocket` per core.
 //! quinn-proto does no I/O or timekeeping itself; [`run_quic_on_core`] drives it by hand.
 
-use std::{collections::HashMap, net::SocketAddr, path::Path, sync::Arc, time::Instant};
+use std::{
+    collections::HashMap, net::SocketAddr, path::Path, sync::Arc,
+    time::Instant,
+};
 
 use anyhow::Context;
 use bytes::BytesMut;
@@ -15,7 +18,9 @@ use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 
 /// Builds the config shared by all cores, with a fresh self-signed cert
 /// written to `cert_path` for the test client.
-pub fn make_server_config(cert_path: &Path) -> anyhow::Result<Arc<ServerConfig>> {
+pub fn make_server_config(
+    cert_path: &Path,
+) -> anyhow::Result<Arc<ServerConfig>> {
     let cert_key = generate_simple_self_signed(vec!["localhost".into()])
         .context("failed to generate self-signed certificate")?;
     let cert_der = CertificateDer::from(cert_key.cert);
@@ -24,7 +29,9 @@ pub fn make_server_config(cert_path: &Path) -> anyhow::Result<Arc<ServerConfig>>
     // Unlink first: an old file owned by another user can't be overwritten.
     let _ = std::fs::remove_file(cert_path);
     match std::fs::write(cert_path, &cert_der) {
-        Ok(()) => log::info!("Self-signed cert written to {}", cert_path.display()),
+        Ok(()) => {
+            log::info!("Self-signed cert written to {}", cert_path.display())
+        }
         Err(e) => log::warn!("Could not write {}: {e}", cert_path.display()),
     }
 
@@ -113,14 +120,24 @@ pub async fn run_quic_on_core(
             Some(DatagramEvent::NewConnection(incoming)) => {
                 match endpoint.accept(incoming, now, &mut scratch_buf, None) {
                     Ok((ch, mut conn)) => {
-                        log::debug!("[core {core}] new connection from {remote}");
+                        log::debug!(
+                            "[core {core}] new connection from {remote}"
+                        );
                         flush_transmits(&socket, &mut conn, now).await;
                         connections.insert(ch, conn);
                     }
                     Err(e) => {
-                        log::warn!("[core {core}] accept from {remote} failed: {}", e.cause);
+                        log::warn!(
+                            "[core {core}] accept from {remote} failed: {}",
+                            e.cause
+                        );
                         if let Some(t) = e.response {
-                            udp_send(&socket, &scratch_buf[..t.size], t.destination).await;
+                            udp_send(
+                                &socket,
+                                &scratch_buf[..t.size],
+                                t.destination,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -149,7 +166,10 @@ fn echo(core: usize, conn: &mut quinn::Connection, id: StreamId, data: &[u8]) {
     let mut send = conn.send_stream(id);
     match send.write(data) {
         Ok(n) if n == data.len() => {}
-        Ok(n) => log::warn!("[core {core}] {id}: echo truncated to {n}/{} bytes", data.len()),
+        Ok(n) => log::warn!(
+            "[core {core}] {id}: echo truncated to {n}/{} bytes",
+            data.len()
+        ),
         Err(e) => {
             log::warn!("[core {core}] {id}: echo failed: {e}");
             return;
@@ -229,8 +249,10 @@ mod tests {
 
     impl TempDir {
         fn new(name: &str) -> TempDir {
-            let dir = std::env::temp_dir()
-                .join(format!("quicmonoio-unit-{}-{name}", std::process::id()));
+            let dir = std::env::temp_dir().join(format!(
+                "quicmonoio-unit-{}-{name}",
+                std::process::id()
+            ));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             TempDir(dir)

@@ -16,19 +16,26 @@ fn client_endpoint(trusted_cert: Vec<u8>) -> Endpoint {
         .with_no_client_auth();
     crypto.alpn_protocols = vec![b"echo".to_vec()];
 
-    let mut config =
-        quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto).unwrap()));
+    let mut config = quinn::ClientConfig::new(Arc::new(
+        QuicClientConfig::try_from(crypto).unwrap(),
+    ));
     // So a stalled connection fails the test instead of hanging it.
     let mut transport = quinn::TransportConfig::default();
-    transport.max_idle_timeout(Some(Duration::from_secs(5).try_into().unwrap()));
+    transport
+        .max_idle_timeout(Some(Duration::from_secs(5).try_into().unwrap()));
     config.transport_config(Arc::new(transport));
 
-    let mut endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    let mut endpoint =
+        Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
     endpoint.set_default_client_config(config);
     endpoint
 }
 
-async fn echo(endpoint: &Endpoint, addr: SocketAddr, message: &[u8]) -> Vec<u8> {
+async fn echo(
+    endpoint: &Endpoint,
+    addr: SocketAddr,
+    message: &[u8],
+) -> Vec<u8> {
     let conn = endpoint
         .connect(addr, "localhost")
         .unwrap()
@@ -47,7 +54,8 @@ async fn quic_echo() {
     let server = Server::start("quic_echo");
     let endpoint = client_endpoint(std::fs::read(server.cert_path()).unwrap());
 
-    let reply = echo(&endpoint, server.quic_addr(), b"hello from the test").await;
+    let reply =
+        echo(&endpoint, server.quic_addr(), b"hello from the test").await;
     assert_eq!(reply, b"hello from the test");
 
     endpoint.wait_idle().await;
@@ -79,15 +87,11 @@ async fn quic_echo_concurrent_connections() {
 #[tokio::test]
 async fn quic_rejects_untrusted_cert() {
     let server = Server::start("quic_rejects_untrusted_cert");
-    let other = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let other =
+        rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let endpoint = client_endpoint(other.cert.der().to_vec());
 
-    let result = endpoint
-        .connect(server.quic_addr(), "localhost")
-        .unwrap()
-        .await;
-    assert!(
-        result.is_err(),
-        "handshake with an untrusted cert succeeded"
-    );
+    let result =
+        endpoint.connect(server.quic_addr(), "localhost").unwrap().await;
+    assert!(result.is_err(), "handshake with an untrusted cert succeeded");
 }

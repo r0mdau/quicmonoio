@@ -34,8 +34,9 @@ impl Dir {
             .join("quicmonoio-tests")
             .join(format!("{name}-{}-{id}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path)
-            .unwrap_or_else(|e| panic!("failed to create {}: {e}", path.display()));
+        std::fs::create_dir_all(&path).unwrap_or_else(|e| {
+            panic!("failed to create {}: {e}", path.display())
+        });
         Dir(path)
     }
 }
@@ -111,7 +112,8 @@ impl ServerCommand {
         let threads = thread::available_parallelism()
             .map_or(1, NonZeroUsize::get)
             .min(2);
-        let stderr = File::create(self.stderr_path()).expect("failed to create stderr log");
+        let stderr = File::create(self.stderr_path())
+            .expect("failed to create stderr log");
         let child = bin()
             .current_dir(self.dir())
             .env("RUST_LOG", "info")
@@ -176,16 +178,23 @@ impl Server {
     }
 
     pub fn get(&self, path: &str) -> Response {
-        http_get(self.http_addr(), path)
-            .unwrap_or_else(|e| panic!("GET {path} failed: {e}\nserver stderr:\n{}", self.stderr()))
+        http_get(self.http_addr(), path).unwrap_or_else(|e| {
+            panic!("GET {path} failed: {e}\nserver stderr:\n{}", self.stderr())
+        })
     }
 
     pub fn wait_exit(mut self) -> (ExitStatus, String) {
-        let status = self.poll_until("still running", |server| server.child.try_wait().unwrap());
+        let status = self.poll_until("still running", |server| {
+            server.child.try_wait().unwrap()
+        });
         (status, self.stderr())
     }
 
-    fn poll_until<T>(&mut self, what: &str, mut ready: impl FnMut(&mut Self) -> Option<T>) -> T {
+    fn poll_until<T>(
+        &mut self,
+        what: &str,
+        mut ready: impl FnMut(&mut Self) -> Option<T>,
+    ) -> T {
         let deadline = Instant::now() + STARTUP_TIMEOUT;
         loop {
             if let Some(value) = ready(self) {
@@ -251,21 +260,13 @@ pub fn http_request(addr: SocketAddr, raw: &str) -> std::io::Result<Response> {
 fn parse_response(raw: &str) -> Option<Response> {
     let (head, body) = raw.split_once("\r\n\r\n")?;
     let mut lines = head.split("\r\n");
-    let status = lines
-        .next()?
-        .strip_prefix("HTTP/1.1 ")?
-        .get(..3)?
-        .parse()
-        .ok()?;
+    let status =
+        lines.next()?.strip_prefix("HTTP/1.1 ")?.get(..3)?.parse().ok()?;
     let headers = lines
         .map(|line| {
             let (k, v) = line.split_once(':')?;
             Some((k.trim().to_owned(), v.trim().to_owned()))
         })
         .collect::<Option<_>>()?;
-    Some(Response {
-        status,
-        headers,
-        body: body.to_owned(),
-    })
+    Some(Response { status, headers, body: body.to_owned() })
 }

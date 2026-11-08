@@ -11,10 +11,7 @@ fn assert_bind_failure(cmd: ServerCommand, expected: &str) {
         "server exited successfully\nstderr:\n{stderr}"
     );
     assert!(stderr.contains(expected), "stderr:\n{stderr}");
-    assert!(
-        stderr.contains("Address already in use"),
-        "stderr:\n{stderr}"
-    );
+    assert!(stderr.contains("Address already in use"), "stderr:\n{stderr}");
 }
 
 // std doesn't set SO_REUSEPORT, so the server can't share these ports.
@@ -44,10 +41,8 @@ fn quic_bind_failure_exits_nonzero_with_message() {
 
 #[test]
 fn invalid_address_is_a_usage_error() {
-    let output = bin()
-        .args(["--http-addr", "not-an-address"])
-        .output()
-        .unwrap();
+    let output =
+        bin().args(["--http-addr", "not-an-address"]).output().unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(2), "stderr:\n{stderr}");
     assert!(stderr.contains("--http-addr"), "stderr:\n{stderr}");

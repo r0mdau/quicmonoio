@@ -15,10 +15,10 @@ use std::{
 use anyhow::{Context, bail};
 use clap::Parser;
 use monoio::{
+    IoUringDriver,
     io::{AsyncReadRent, AsyncWriteRentExt},
     net::{ListenerOpts, TcpListener},
     utils::bind_to_cpu_set,
-    IoUringDriver,
 };
 
 mod cli;
@@ -65,7 +65,9 @@ fn run(config: Config) -> anyhow::Result<()> {
                 }));
                 let _ = tx.send((core, res));
             })
-            .with_context(|| format!("failed to spawn thread for core {core}"))?;
+            .with_context(|| {
+                format!("failed to spawn thread for core {core}")
+            })?;
     }
     drop(tx);
 
@@ -101,7 +103,9 @@ async fn serve(
     let quic_socket = quic::bind_udp_socket(quic_addr)?;
     let opts = ListenerOpts::default().reuse_port(true).reuse_addr(true);
     let listener = TcpListener::bind_with_config(http_addr, &opts)
-        .with_context(|| format!("failed to bind HTTP listener on {http_addr}"))?;
+        .with_context(|| {
+            format!("failed to bind HTTP listener on {http_addr}")
+        })?;
 
     monoio::spawn(quic::run_quic_on_core(core, quic_config, quic_socket));
 
@@ -198,25 +202,33 @@ mod tests {
 
     #[test]
     fn parse_request_line_extracts_method_and_path() {
-        let raw = "GET /health HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\n\r\n";
+        let raw =
+            "GET /health HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\n\r\n";
         assert_eq!(parse_request_line(raw), ("GET", "/health"));
     }
 
     #[test]
     fn parse_request_line_only_reads_first_line() {
-        let raw = "POST /submit HTTP/1.1\r\nX-Fake: GET /other HTTP/1.1\r\n\r\nbody";
+        let raw =
+            "POST /submit HTTP/1.1\r\nX-Fake: GET /other HTTP/1.1\r\n\r\nbody";
         assert_eq!(parse_request_line(raw), ("POST", "/submit"));
     }
 
     #[test]
     fn parse_request_line_accepts_bare_newlines_and_extra_whitespace() {
-        assert_eq!(parse_request_line("GET   /a\tHTTP/1.0\nHost: x\n"), ("GET", "/a"));
+        assert_eq!(
+            parse_request_line("GET   /a\tHTTP/1.0\nHost: x\n"),
+            ("GET", "/a")
+        );
         assert_eq!(parse_request_line("  GET / HTTP/1.1"), ("GET", "/"));
     }
 
     #[test]
     fn parse_request_line_keeps_query_string_in_path() {
-        assert_eq!(parse_request_line("GET /health?x=1 HTTP/1.1\r\n"), ("GET", "/health?x=1"));
+        assert_eq!(
+            parse_request_line("GET /health?x=1 HTTP/1.1\r\n"),
+            ("GET", "/health?x=1")
+        );
     }
 
     #[test]
@@ -242,9 +254,17 @@ mod tests {
 
     #[test]
     fn build_response_reason_phrases() {
-        assert!(build_response(200, "t", "").starts_with("HTTP/1.1 200 OK\r\n"));
-        assert!(build_response(404, "t", "").starts_with("HTTP/1.1 404 Not Found\r\n"));
-        assert!(build_response(500, "t", "").starts_with("HTTP/1.1 500 Unknown\r\n"));
+        assert!(
+            build_response(200, "t", "").starts_with("HTTP/1.1 200 OK\r\n")
+        );
+        assert!(
+            build_response(404, "t", "")
+                .starts_with("HTTP/1.1 404 Not Found\r\n")
+        );
+        assert!(
+            build_response(500, "t", "")
+                .starts_with("HTTP/1.1 500 Unknown\r\n")
+        );
     }
 
     #[test]
@@ -259,7 +279,10 @@ mod tests {
     #[test]
     fn build_response_empty_body() {
         let response = build_response(404, "text/plain", "");
-        assert!(response.ends_with("Content-Length: 0\r\nConnection: close\r\n\r\n"));
+        assert!(
+            response
+                .ends_with("Content-Length: 0\r\nConnection: close\r\n\r\n")
+        );
     }
 
     #[test]
@@ -269,7 +292,10 @@ mod tests {
 
     #[test]
     fn route_health_serves_json() {
-        assert_eq!(route("GET", "/health"), (200, "application/json", r#"{"status":"ok"}"#));
+        assert_eq!(
+            route("GET", "/health"),
+            (200, "application/json", r#"{"status":"ok"}"#)
+        );
     }
 
     #[test]
@@ -282,7 +308,11 @@ mod tests {
             ("get", "/"),
             ("", "/"),
         ] {
-            assert_eq!(route(method, path), (404, "text/plain", "404 Not Found"), "{method} {path}");
+            assert_eq!(
+                route(method, path),
+                (404, "text/plain", "404 Not Found"),
+                "{method} {path}"
+            );
         }
     }
 }
