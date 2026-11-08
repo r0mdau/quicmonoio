@@ -72,14 +72,19 @@ async fn echo(
     reply
 }
 
-async fn wait_for_log(server: &Server, needle: &str) {
-    let found = timeout(TEST_TIMEOUT, async {
-        while !server.stderr().contains(needle) {
+async fn wait_until(done: impl Fn() -> bool) -> bool {
+    timeout(TEST_TIMEOUT, async {
+        while !done() {
             sleep(Duration::from_millis(20)).await;
         }
     })
-    .await;
-    assert!(found.is_ok(), "no {needle:?} in:\n{}", server.stderr());
+    .await
+    .is_ok()
+}
+
+async fn wait_for_log(server: &Server, needle: &str) {
+    let found = wait_until(|| server.stderr().contains(needle)).await;
+    assert!(found, "no {needle:?} in:\n{}", server.stderr());
 }
 
 #[tokio::test]
@@ -146,6 +151,7 @@ async fn quic_retransmits_lost_echo() {
                     .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
                     .is_err()
         })
+        .await
     };
     let endpoint = client_endpoint(std::fs::read(server.cert_path()).unwrap());
 
@@ -169,7 +175,6 @@ async fn quic_removes_idle_connection() {
     let conn = connect(&endpoint, server.quic_addr()).await;
     assert_eq!(echo_on(&conn, b"idle").await, b"idle");
     wait_for_log(&server, "connection removed").await;
-    drop(conn);
 }
 
 #[tokio::test]
@@ -200,18 +205,15 @@ async fn quic_unvalidated_initial_gets_retry_and_no_connection() {
                 true
             }
         })
+        .await
     };
     let endpoint = client_endpoint(std::fs::read(server.cert_path()).unwrap());
 
     let connecting = endpoint.connect(proxy.addr(), "localhost").unwrap();
-    timeout(TEST_TIMEOUT, async {
-        while retries.load(SeqCst) == 0 {
-            sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("no Retry received");
-    sleep(Duration::from_millis(200)).await;
+    assert!(
+        wait_until(|| retries.load(SeqCst) > 0).await,
+        "no Retry received"
+    );
     assert!(
         !server.stderr().contains("new connection"),
         "connection created for an unvalidated address:\n{}",

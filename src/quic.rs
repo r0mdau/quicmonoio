@@ -91,19 +91,23 @@ struct TrackedConnection {
     deadline: Option<Instant>,
 }
 
-/// The socket stays outside: the pending recv borrows it.
-struct QuicCore {
+struct QuicCore<'a> {
     core: usize,
+    socket: &'a UdpSocket,
     endpoint: Endpoint,
     connections: HashMap<ConnectionHandle, TrackedConnection>,
     deadlines: BTreeSet<(Instant, ConnectionHandle)>,
     scratch_buf: Vec<u8>,
 }
 
-impl QuicCore {
+impl QuicCore<'_> {
+    async fn send_scratch(&self, t: quinn::Transmit) {
+        udp_send(self.socket, &self.scratch_buf[..t.size], t.destination)
+            .await;
+    }
+
     async fn handle_datagram(
         &mut self,
-        socket: &UdpSocket,
         data: BytesMut,
         remote: SocketAddr,
         now: Instant,
@@ -119,41 +123,23 @@ impl QuicCore {
         );
         match event {
             Some(DatagramEvent::NewConnection(incoming)) => {
-                self.handle_incoming(socket, incoming, now).await;
+                self.handle_incoming(incoming, now).await;
             }
             Some(DatagramEvent::ConnectionEvent(ch, event)) => {
-                if let Some(tracked) = self.connections.get_mut(&ch) {
-                    tracked.conn.handle_event(event);
-                    self.drive(socket, ch, now).await;
-                }
+                self.drive(ch, now, |conn| conn.handle_event(event)).await;
             }
             // Stateless reply, e.g. version negotiation.
-            Some(DatagramEvent::Response(t)) => {
-                udp_send(socket, &self.scratch_buf[..t.size], t.destination)
-                    .await;
-            }
+            Some(DatagramEvent::Response(t)) => self.send_scratch(t).await,
             None => {}
         }
     }
 
-    async fn handle_incoming(
-        &mut self,
-        socket: &UdpSocket,
-        incoming: Incoming,
-        now: Instant,
-    ) {
+    async fn handle_incoming(&mut self, incoming: Incoming, now: Instant) {
         let core = self.core;
         let remote = incoming.remote_address();
         if !incoming.remote_address_validated() {
             match self.endpoint.retry(incoming, &mut self.scratch_buf) {
-                Ok(t) => {
-                    udp_send(
-                        socket,
-                        &self.scratch_buf[..t.size],
-                        t.destination,
-                    )
-                    .await;
-                }
+                Ok(t) => self.send_scratch(t).await,
                 Err(e) => self.endpoint.ignore(e.into_incoming()),
             }
             return;
@@ -164,7 +150,7 @@ impl QuicCore {
                 log::debug!("[core {core}] new connection from {remote}");
                 self.connections
                     .insert(ch, TrackedConnection { conn, deadline: None });
-                self.drive(socket, ch, now).await;
+                self.drive(ch, now, |_| {}).await;
             }
             Err(e) => {
                 log::warn!(
@@ -172,18 +158,13 @@ impl QuicCore {
                     e.cause
                 );
                 if let Some(t) = e.response {
-                    udp_send(
-                        socket,
-                        &self.scratch_buf[..t.size],
-                        t.destination,
-                    )
-                    .await;
+                    self.send_scratch(t).await;
                 }
             }
         }
     }
 
-    async fn handle_timeouts(&mut self, socket: &UdpSocket, now: Instant) {
+    async fn handle_timeouts(&mut self, now: Instant) {
         let expired: Vec<_> = self
             .deadlines
             .iter()
@@ -191,28 +172,26 @@ impl QuicCore {
             .map(|&(_, ch)| ch)
             .collect();
         for ch in expired {
-            if let Some(tracked) = self.connections.get_mut(&ch) {
-                tracked.conn.handle_timeout(now);
-                self.drive(socket, ch, now).await;
-            }
+            self.drive(ch, now, |conn| conn.handle_timeout(now)).await;
         }
     }
 
-    /// To run after anything that can change the state of connection `ch`.
+    /// Every change to a connection's state must go through here.
     async fn drive(
         &mut self,
-        socket: &UdpSocket,
         ch: ConnectionHandle,
         now: Instant,
+        update: impl FnOnce(&mut quinn::Connection),
     ) {
         let core = self.core;
         let Some(tracked) = self.connections.get_mut(&ch) else { return };
         let conn = &mut tracked.conn;
+        update(conn);
         drain_endpoint_events(&mut self.endpoint, ch, conn);
         for (id, data) in drain_app_events(core, conn) {
             echo(core, conn, id, &data);
         }
-        flush_transmits(socket, conn, now).await;
+        flush_transmits(self.socket, conn, now).await;
 
         if let Some(old) = tracked.deadline.take() {
             self.deadlines.remove(&(old, ch));
@@ -239,6 +218,7 @@ pub async fn run_quic_on_core(
 ) {
     let mut state = QuicCore {
         core,
+        socket: &socket,
         endpoint: Endpoint::new(
             Arc::new(EndpointConfig::default()),
             Some(server_config),
@@ -267,13 +247,13 @@ pub async fn run_quic_on_core(
                 Ok((0, _)) => {}
                 Ok((n, remote)) => {
                     let data = BytesMut::from(&buf[..n]);
-                    state.handle_datagram(&socket, data, remote, now).await;
+                    state.handle_datagram(data, remote, now).await;
                 }
                 Err(e) => log::warn!("[core {core}] UDP recv failed: {e}"),
             }
             recv.set(socket.recv_from(buf));
         }
-        state.handle_timeouts(&socket, now).await;
+        state.handle_timeouts(now).await;
     }
 }
 

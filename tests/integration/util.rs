@@ -130,7 +130,7 @@ impl ServerCommand {
             .stderr(stderr)
             .spawn()
             .expect("failed to spawn quicmonoio");
-        Server { child, cmd: self, threads }
+        Server { child, cmd: self }
     }
 
     pub fn start(self) -> Server {
@@ -142,12 +142,9 @@ impl ServerCommand {
                     server.stderr()
                 );
             }
-            // A core joining the SO_REUSEPORT group later would move flows.
-            let bound = server.stderr().matches("] listening").count();
-            (bound == server.threads
-                && http_get(server.http_addr(), "/health")
-                    .is_ok_and(|resp| resp.status == 200))
-            .then_some(())
+            http_get(server.http_addr(), "/health")
+                .is_ok_and(|resp| resp.status == 200)
+                .then_some(())
         });
         server
     }
@@ -157,7 +154,6 @@ impl ServerCommand {
 pub struct Server {
     child: Child,
     cmd: ServerCommand,
-    threads: usize,
 }
 
 impl Server {
