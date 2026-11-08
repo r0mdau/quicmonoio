@@ -214,3 +214,49 @@ fn read_stream(conn: &mut quinn::Connection, id: StreamId) -> Vec<u8> {
     let _ = chunks.finalize();
     data
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> TempDir {
+            let dir = std::env::temp_dir()
+                .join(format!("quicmonoio-unit-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            TempDir(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn trust(path: &Path) -> rustls::RootCertStore {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(CertificateDer::from(std::fs::read(path).unwrap())).unwrap();
+        roots
+    }
+
+    #[test]
+    fn make_server_config_writes_a_trustable_cert() {
+        let dir = TempDir::new("server-config");
+        let path = dir.0.join("cert.der");
+        make_server_config(&path).unwrap();
+        assert_eq!(trust(&path).len(), 1);
+    }
+
+    #[test]
+    fn make_server_config_replaces_an_existing_cert() {
+        let dir = TempDir::new("server-config-replace");
+        let path = dir.0.join("cert.der");
+        std::fs::write(&path, b"stale").unwrap();
+        make_server_config(&path).unwrap();
+        assert_eq!(trust(&path).len(), 1);
+    }
+}

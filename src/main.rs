@@ -182,3 +182,104 @@ const WELCOME_HTML: &str = "\
   <p>Thread-per-core HTTP server powered by io_uring.</p>
 </body>
 </html>";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn split_response(response: &str) -> (&str, &str) {
+        response
+            .split_once("\r\n\r\n")
+            .expect("response has no header/body separator")
+    }
+
+    #[test]
+    fn parse_request_line_extracts_method_and_path() {
+        let raw = "GET /health HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\n\r\n";
+        assert_eq!(parse_request_line(raw), ("GET", "/health"));
+    }
+
+    #[test]
+    fn parse_request_line_only_reads_first_line() {
+        let raw = "POST /submit HTTP/1.1\r\nX-Fake: GET /other HTTP/1.1\r\n\r\nbody";
+        assert_eq!(parse_request_line(raw), ("POST", "/submit"));
+    }
+
+    #[test]
+    fn parse_request_line_accepts_bare_newlines_and_extra_whitespace() {
+        assert_eq!(parse_request_line("GET   /a\tHTTP/1.0\nHost: x\n"), ("GET", "/a"));
+        assert_eq!(parse_request_line("  GET / HTTP/1.1"), ("GET", "/"));
+    }
+
+    #[test]
+    fn parse_request_line_keeps_query_string_in_path() {
+        assert_eq!(parse_request_line("GET /health?x=1 HTTP/1.1\r\n"), ("GET", "/health?x=1"));
+    }
+
+    #[test]
+    fn parse_request_line_defaults_on_missing_parts() {
+        assert_eq!(parse_request_line(""), ("", "/"));
+        assert_eq!(parse_request_line("\r\n"), ("", "/"));
+        assert_eq!(parse_request_line("GET"), ("GET", "/"));
+    }
+
+    #[test]
+    fn build_response_formats_status_headers_and_body() {
+        let response = build_response(200, "text/plain", "hello");
+        assert_eq!(
+            response,
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: text/plain\r\n\
+             Content-Length: 5\r\n\
+             Connection: close\r\n\
+             \r\n\
+             hello"
+        );
+    }
+
+    #[test]
+    fn build_response_reason_phrases() {
+        assert!(build_response(200, "t", "").starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(build_response(404, "t", "").starts_with("HTTP/1.1 404 Not Found\r\n"));
+        assert!(build_response(500, "t", "").starts_with("HTTP/1.1 500 Unknown\r\n"));
+    }
+
+    #[test]
+    fn build_response_content_length_counts_bytes_not_chars() {
+        let body = "héllo ✓"; // 7 chars, 10 bytes
+        let response = build_response(200, "text/plain; charset=utf-8", body);
+        let (head, got_body) = split_response(&response);
+        assert!(head.contains("\r\nContent-Length: 10\r\n"), "{head}");
+        assert_eq!(got_body, body);
+    }
+
+    #[test]
+    fn build_response_empty_body() {
+        let response = build_response(404, "text/plain", "");
+        assert!(response.ends_with("Content-Length: 0\r\nConnection: close\r\n\r\n"));
+    }
+
+    #[test]
+    fn route_root_serves_welcome_page() {
+        assert_eq!(route("GET", "/"), (200, "text/html", WELCOME_HTML));
+    }
+
+    #[test]
+    fn route_health_serves_json() {
+        assert_eq!(route("GET", "/health"), (200, "application/json", r#"{"status":"ok"}"#));
+    }
+
+    #[test]
+    fn route_unknown_is_404() {
+        for (method, path) in [
+            ("GET", "/nope"),
+            ("GET", "/health/"),
+            ("GET", "/health?x=1"),
+            ("POST", "/"),
+            ("get", "/"),
+            ("", "/"),
+        ] {
+            assert_eq!(route(method, path), (404, "text/plain", "404 Not Found"), "{method} {path}");
+        }
+    }
+}
