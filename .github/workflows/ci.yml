@@ -17,8 +17,6 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Overrides rust-toolchain.toml, which would otherwise win over the installed toolchain.
-  RUSTUP_TOOLCHAIN: stable
 
 jobs:
   test:
@@ -27,11 +25,10 @@ jobs:
     timeout-minutes: 30
     env:
       RUST_BACKTRACE: 1
-      RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
     strategy:
       fail-fast: false
       matrix:
-        # TODO(rebase): sync the pinned version with `rust-version` in Cargo.toml.
+        # 1.88.0 must match `rust-version` in Cargo.toml.
         rust: [1.88.0, stable, nightly]
     steps:
     - name: Checkout repository
