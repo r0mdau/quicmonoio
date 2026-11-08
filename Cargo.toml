@@ -24,7 +24,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 [profile.release]
 debug = 1
 
-# No panic = "abort": the per-core NotifyOnExit guard needs unwinding to report a core panic.
+# No panic = "abort": main relies on catch_unwind to report a core panic.
 [profile.release-lto]
 inherits = "release"
 lto = "fat"
