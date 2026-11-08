@@ -10,14 +10,17 @@ use std::{
     process::ExitCode,
     sync::{Arc, mpsc},
     thread::{self, available_parallelism},
+    time::Duration,
 };
 
 use anyhow::{Context, bail};
 use clap::Parser;
 use monoio::{
     IoUringDriver,
-    io::{AsyncReadRent, AsyncWriteRentExt},
-    net::{ListenerOpts, TcpListener},
+    buf::IoBufMut,
+    io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt},
+    net::{ListenerOpts, TcpListener, TcpStream},
+    time::{sleep, timeout},
     utils::bind_to_cpu_set,
 };
 
@@ -25,6 +28,14 @@ mod cli;
 mod quic;
 
 use cli::Config;
+
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_HEAD_SIZE: usize = 8 * 1024;
+const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(5);
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+const BAD_REQUEST: &str = "400 Bad Request";
+const HEAD_TOO_LARGE: &str = "431 Request Header Fields Too Large";
 
 fn main() -> ExitCode {
     let config = Config::parse();
@@ -109,39 +120,123 @@ async fn serve(
 
     monoio::spawn(quic::run_quic_on_core(core, quic_config, quic_socket));
 
+    let mut backoff = Duration::ZERO;
     loop {
         match listener.accept().await {
             Ok((stream, addr)) => {
+                backoff = Duration::ZERO;
                 monoio::spawn(async move {
                     if let Err(e) = handle_connection(stream).await {
                         log::warn!("[core {core}] {addr}: {e}");
                     }
                 });
             }
-            Err(e) => log::warn!("[core {core}] accept failed: {e}"),
+            Err(e) => {
+                backoff = next_accept_backoff(backoff);
+                log::warn!(
+                    "[core {core}] accept failed, retrying in {backoff:?}: {e}"
+                );
+                sleep(backoff).await;
+            }
         }
     }
 }
 
-async fn handle_connection(
-    mut stream: monoio::net::TcpStream,
-) -> std::io::Result<()> {
-    // 4 KiB is enough for the request line.
-    let (res, buf) = stream.read(Vec::with_capacity(4096)).await;
-    let n = res?;
-    if n == 0 {
-        return Ok(());
-    }
+fn next_accept_backoff(previous: Duration) -> Duration {
+    (previous * 2).clamp(ACCEPT_BACKOFF_MIN, ACCEPT_BACKOFF_MAX)
+}
 
-    let request = String::from_utf8_lossy(&buf[..n]);
-    let (method, path) = parse_request_line(&request);
+enum RequestHead {
+    Complete(Vec<u8>),
+    Empty,
+    Truncated,
+    TooLarge,
+}
+
+async fn handle_connection(mut stream: TcpStream) -> std::io::Result<()> {
+    // One deadline for the whole head, so trickled bytes can't extend it.
+    let Ok(head) = timeout(READ_TIMEOUT, read_head(&mut stream)).await else {
+        log::debug!("timed out reading request");
+        return Ok(());
+    };
+    let head = head?;
+    let unread_input = matches!(head, RequestHead::TooLarge);
+    let response = match head {
+        RequestHead::Complete(buf) => respond(&String::from_utf8_lossy(&buf)),
+        RequestHead::Empty => return Ok(()),
+        RequestHead::Truncated => {
+            build_response(400, "text/plain", BAD_REQUEST)
+        }
+        RequestHead::TooLarge => {
+            build_response(431, "text/plain", HEAD_TOO_LARGE)
+        }
+    };
+
+    let write = stream.write_all(response.into_bytes());
+    let Ok((res, _)) = timeout(WRITE_TIMEOUT, write).await else {
+        log::debug!("timed out writing response");
+        return Ok(());
+    };
+    res?;
+    if unread_input {
+        let _ = timeout(READ_TIMEOUT, drain(&mut stream)).await;
+    }
+    Ok(())
+}
+
+/// Closing with unread input sends RST, and the client loses the response.
+async fn drain(stream: &mut TcpStream) {
+    if stream.shutdown().await.is_err() {
+        return;
+    }
+    let mut buf = Vec::with_capacity(MAX_HEAD_SIZE);
+    loop {
+        let (res, returned) = stream.read(buf).await;
+        buf = returned;
+        if !matches!(res, Ok(n) if n > 0) {
+            return;
+        }
+    }
+}
+
+async fn read_head(stream: &mut TcpStream) -> std::io::Result<RequestHead> {
+    let mut buf = Vec::with_capacity(MAX_HEAD_SIZE);
+    loop {
+        let start = buf.len();
+        let (res, slice) =
+            stream.read(buf.slice_mut(start..MAX_HEAD_SIZE)).await;
+        buf = slice.into_inner();
+        if res? == 0 {
+            return Ok(if buf.is_empty() {
+                RequestHead::Empty
+            } else {
+                RequestHead::Truncated
+            });
+        }
+        // The terminator may straddle two reads.
+        if head_is_complete(&buf[start.saturating_sub(2)..]) {
+            return Ok(RequestHead::Complete(buf));
+        }
+        if buf.len() == MAX_HEAD_SIZE {
+            return Ok(RequestHead::TooLarge);
+        }
+    }
+}
+
+/// True if `buf` holds a blank line; bare newlines count, as when parsing.
+fn head_is_complete(buf: &[u8]) -> bool {
+    buf.windows(2).any(|w| w == b"\n\n")
+        || buf.windows(3).any(|w| w == b"\n\r\n")
+}
+
+fn respond(request: &str) -> String {
+    if !is_valid_request_line(request) {
+        return build_response(400, "text/plain", BAD_REQUEST);
+    }
+    let (method, path) = parse_request_line(request);
     let (status, content_type, body) = route(method, path);
     log::debug!("{method} {path} -> {status}");
-
-    let response = build_response(status, content_type, body);
-    let (res, _) = stream.write_all(response.into_bytes()).await;
-    res?;
-    Ok(())
+    build_response(status, content_type, body)
 }
 
 /// (status, content type, body) for a request.
@@ -162,11 +257,19 @@ fn parse_request_line(raw: &str) -> (&str, &str) {
     (method, path)
 }
 
+fn is_valid_request_line(raw: &str) -> bool {
+    let mut parts = raw.lines().next().unwrap_or("").split_whitespace();
+    let version = parts.nth(2);
+    version.is_some_and(|v| v.starts_with("HTTP/")) && parts.next().is_none()
+}
+
 /// Build a minimal HTTP/1.1 response.
 fn build_response(status: u16, content_type: &str, body: &str) -> String {
     let reason = match status {
         200 => "OK",
+        400 => "Bad Request",
         404 => "Not Found",
+        431 => "Request Header Fields Too Large",
         _ => "Unknown",
     };
     format!(
@@ -198,6 +301,37 @@ mod tests {
         response
             .split_once("\r\n\r\n")
             .expect("response has no header/body separator")
+    }
+
+    #[test]
+    fn accept_backoff_grows_then_caps() {
+        let first = next_accept_backoff(Duration::ZERO);
+        assert_eq!(first, ACCEPT_BACKOFF_MIN);
+        assert_eq!(next_accept_backoff(first), first * 2);
+        assert_eq!(
+            next_accept_backoff(ACCEPT_BACKOFF_MAX),
+            ACCEPT_BACKOFF_MAX
+        );
+    }
+
+    #[test]
+    fn head_is_complete_needs_a_blank_line() {
+        for head in ["a\r\n\r\n", "a\n\n", "a\n\r\n", "a\r\n\r\nbody"] {
+            assert!(head_is_complete(head.as_bytes()), "{head:?}");
+        }
+        for head in ["", "a", "a\r\n", "a\r\n\r", "a\r\nb\r\n"] {
+            assert!(!head_is_complete(head.as_bytes()), "{head:?}");
+        }
+    }
+
+    #[test]
+    fn is_valid_request_line_requires_three_parts_and_a_version() {
+        assert!(is_valid_request_line("GET / HTTP/1.1\r\nHost: x\r\n"));
+        for raw in
+            ["", "\r\n", "GET", "GET /", "GET / FTP/1", "GET / a HTTP/1.1"]
+        {
+            assert!(!is_valid_request_line(raw), "{raw:?}");
+        }
     }
 
     #[test]
@@ -260,6 +394,15 @@ mod tests {
         assert!(
             build_response(404, "t", "")
                 .starts_with("HTTP/1.1 404 Not Found\r\n")
+        );
+        assert!(
+            build_response(400, "t", "")
+                .starts_with("HTTP/1.1 400 Bad Request\r\n")
+        );
+        assert!(
+            build_response(431, "t", "").starts_with(
+                "HTTP/1.1 431 Request Header Fields Too Large\r\n"
+            )
         );
         assert!(
             build_response(500, "t", "")
