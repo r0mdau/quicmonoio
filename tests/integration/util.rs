@@ -116,7 +116,7 @@ impl ServerCommand {
             .expect("failed to create stderr log");
         let child = bin()
             .current_dir(self.dir())
-            .env("RUST_LOG", "info")
+            .env("RUST_LOG", "debug")
             .arg("--http-addr")
             .arg(self.http_addr.to_string())
             .arg("--quic-addr")

@@ -8,7 +8,7 @@ use std::{
     num::NonZeroUsize,
     panic::{self, AssertUnwindSafe},
     process::ExitCode,
-    sync::{Arc, mpsc},
+    sync::{Arc, Barrier, mpsc},
     thread::{self, available_parallelism},
     time::Duration,
 };
@@ -66,13 +66,21 @@ fn run(config: Config) -> anyhow::Result<()> {
     // Cores serve forever, so the first one to report back (error or panic)
     // is fatal.
     let (tx, rx) = mpsc::channel();
+    let all_bound = Arc::new(Barrier::new(thread_count));
     for core in 0..thread_count {
-        let (quic_config, tx) = (quic_config.clone(), tx.clone());
+        let (quic_config, all_bound, tx) =
+            (quic_config.clone(), all_bound.clone(), tx.clone());
         thread::Builder::new()
             .name(format!("core-{core}"))
             .spawn(move || {
                 let res = panic::catch_unwind(AssertUnwindSafe(|| {
-                    run_core(core, http_addr, quic_addr, quic_config)
+                    run_core(
+                        core,
+                        http_addr,
+                        quic_addr,
+                        quic_config,
+                        all_bound,
+                    )
                 }));
                 let _ = tx.send((core, res));
             })
@@ -95,6 +103,7 @@ fn run_core(
     http_addr: SocketAddr,
     quic_addr: SocketAddr,
     quic_config: Arc<quinn_proto::ServerConfig>,
+    all_bound: Arc<Barrier>,
 ) -> anyhow::Result<()> {
     bind_to_cpu_set([core])
         .with_context(|| format!("failed to pin thread to CPU {core}"))?;
@@ -102,7 +111,7 @@ fn run_core(
         .enable_timer()
         .build()
         .context("failed to build io_uring runtime")?
-        .block_on(serve(core, http_addr, quic_addr, quic_config))
+        .block_on(serve(core, http_addr, quic_addr, quic_config, all_bound))
 }
 
 async fn serve(
@@ -110,6 +119,7 @@ async fn serve(
     http_addr: SocketAddr,
     quic_addr: SocketAddr,
     quic_config: Arc<quinn_proto::ServerConfig>,
+    all_bound: Arc<Barrier>,
 ) -> anyhow::Result<()> {
     let quic_socket = quic::bind_udp_socket(quic_addr)?;
     let opts = ListenerOpts::default().reuse_port(true).reuse_addr(true);
@@ -118,6 +128,8 @@ async fn serve(
             format!("failed to bind HTTP listener on {http_addr}")
         })?;
 
+    // A core joining the SO_REUSEPORT groups later would move live flows.
+    all_bound.wait();
     monoio::spawn(quic::run_quic_on_core(core, quic_config, quic_socket));
 
     let mut backoff = Duration::ZERO;

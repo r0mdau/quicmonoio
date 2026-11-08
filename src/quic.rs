@@ -2,16 +2,20 @@
 //! quinn-proto does no I/O or timekeeping itself; [`run_quic_on_core`] drives it by hand.
 
 use std::{
-    collections::HashMap, net::SocketAddr, path::Path, sync::Arc,
+    collections::{BTreeSet, HashMap},
+    net::SocketAddr,
+    path::Path,
+    pin::pin,
+    sync::Arc,
     time::Instant,
 };
 
 use anyhow::Context;
 use bytes::BytesMut;
-use monoio::net::udp::UdpSocket;
+use monoio::{net::udp::UdpSocket, time::timeout_at};
 use quinn_proto::{
     self as quinn, ConnectionHandle, DatagramEvent, Dir, Endpoint,
-    EndpointConfig, Event, ServerConfig, StreamEvent, StreamId,
+    EndpointConfig, Event, Incoming, ServerConfig, StreamEvent, StreamId,
 };
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
@@ -82,82 +86,174 @@ async fn flush_transmits(
     }
 }
 
+struct TrackedConnection {
+    conn: quinn::Connection,
+    deadline: Option<Instant>,
+}
+
+struct QuicCore<'a> {
+    core: usize,
+    socket: &'a UdpSocket,
+    endpoint: Endpoint,
+    connections: HashMap<ConnectionHandle, TrackedConnection>,
+    deadlines: BTreeSet<(Instant, ConnectionHandle)>,
+    scratch_buf: Vec<u8>,
+}
+
+impl QuicCore<'_> {
+    async fn send_scratch(&self, t: quinn::Transmit) {
+        udp_send(self.socket, &self.scratch_buf[..t.size], t.destination)
+            .await;
+    }
+
+    async fn handle_datagram(
+        &mut self,
+        data: BytesMut,
+        remote: SocketAddr,
+        now: Instant,
+    ) {
+        self.scratch_buf.clear();
+        let event = self.endpoint.handle(
+            now,
+            remote,
+            None,
+            None,
+            data,
+            &mut self.scratch_buf,
+        );
+        match event {
+            Some(DatagramEvent::NewConnection(incoming)) => {
+                self.handle_incoming(incoming, now).await;
+            }
+            Some(DatagramEvent::ConnectionEvent(ch, event)) => {
+                self.drive(ch, now, |conn| conn.handle_event(event)).await;
+            }
+            // Stateless reply, e.g. version negotiation.
+            Some(DatagramEvent::Response(t)) => self.send_scratch(t).await,
+            None => {}
+        }
+    }
+
+    async fn handle_incoming(&mut self, incoming: Incoming, now: Instant) {
+        let core = self.core;
+        let remote = incoming.remote_address();
+        if !incoming.remote_address_validated() {
+            match self.endpoint.retry(incoming, &mut self.scratch_buf) {
+                Ok(t) => self.send_scratch(t).await,
+                Err(e) => self.endpoint.ignore(e.into_incoming()),
+            }
+            return;
+        }
+        match self.endpoint.accept(incoming, now, &mut self.scratch_buf, None)
+        {
+            Ok((ch, conn)) => {
+                log::debug!("[core {core}] new connection from {remote}");
+                self.connections
+                    .insert(ch, TrackedConnection { conn, deadline: None });
+                self.drive(ch, now, |_| {}).await;
+            }
+            Err(e) => {
+                log::warn!(
+                    "[core {core}] accept from {remote} failed: {}",
+                    e.cause
+                );
+                if let Some(t) = e.response {
+                    self.send_scratch(t).await;
+                }
+            }
+        }
+    }
+
+    async fn handle_timeouts(&mut self, now: Instant) {
+        let expired: Vec<_> = self
+            .deadlines
+            .iter()
+            .take_while(|(deadline, _)| *deadline <= now)
+            .map(|&(_, ch)| ch)
+            .collect();
+        for ch in expired {
+            self.drive(ch, now, |conn| conn.handle_timeout(now)).await;
+        }
+    }
+
+    /// Every change to a connection's state must go through here.
+    async fn drive(
+        &mut self,
+        ch: ConnectionHandle,
+        now: Instant,
+        update: impl FnOnce(&mut quinn::Connection),
+    ) {
+        let core = self.core;
+        let Some(tracked) = self.connections.get_mut(&ch) else { return };
+        let conn = &mut tracked.conn;
+        update(conn);
+        drain_endpoint_events(&mut self.endpoint, ch, conn);
+        for (id, data) in drain_app_events(core, conn) {
+            echo(core, conn, id, &data);
+        }
+        flush_transmits(self.socket, conn, now).await;
+
+        if let Some(old) = tracked.deadline.take() {
+            self.deadlines.remove(&(old, ch));
+        }
+        if conn.is_drained() {
+            self.connections.remove(&ch);
+            log::debug!(
+                "[core {core}] connection removed, {} left",
+                self.connections.len()
+            );
+            return;
+        }
+        tracked.deadline = conn.poll_timeout();
+        if let Some(deadline) = tracked.deadline {
+            self.deadlines.insert((deadline, ch));
+        }
+    }
+}
+
 pub async fn run_quic_on_core(
     core: usize,
     server_config: Arc<ServerConfig>,
     socket: UdpSocket,
 ) {
-    let mut endpoint = Endpoint::new(
-        Arc::new(EndpointConfig::default()),
-        Some(server_config),
-        true, // allow_mtud
-        None, // rng_seed
-    );
-    let mut connections: HashMap<ConnectionHandle, quinn::Connection> =
-        HashMap::new();
-    let mut recv_buf = vec![0u8; 65536];
-    let mut scratch_buf = Vec::new();
+    let mut state = QuicCore {
+        core,
+        socket: &socket,
+        endpoint: Endpoint::new(
+            Arc::new(EndpointConfig::default()),
+            Some(server_config),
+            true, // allow_mtud
+            None, // rng_seed
+        ),
+        connections: HashMap::new(),
+        deadlines: BTreeSet::new(),
+        scratch_buf: Vec::new(),
+    };
+    // monoio moves the buffer into the operation and hands it back with the
+    // result, so this future lives across timer wakeups.
+    let mut recv = pin!(socket.recv_from(vec![0u8; 65536]));
 
     loop {
-        // monoio moves the buffer into the operation and hands it back with the result.
-        let (result, buf) = socket.recv_from(recv_buf).await;
-        recv_buf = buf;
-        let (n, remote) = match result {
-            Ok((0, _)) => continue,
-            Ok(ok) => ok,
-            Err(e) => {
-                log::warn!("[core {core}] UDP recv failed: {e}");
-                continue;
+        let received = match state.deadlines.first() {
+            Some(&(deadline, _)) => {
+                timeout_at(deadline.into(), recv.as_mut()).await.ok()
             }
+            None => Some(recv.as_mut().await),
         };
-
         let now = Instant::now();
-        let data = BytesMut::from(&recv_buf[..n]);
-        let event =
-            endpoint.handle(now, remote, None, None, data, &mut scratch_buf);
 
-        match event {
-            Some(DatagramEvent::NewConnection(incoming)) => {
-                match endpoint.accept(incoming, now, &mut scratch_buf, None) {
-                    Ok((ch, mut conn)) => {
-                        log::debug!(
-                            "[core {core}] new connection from {remote}"
-                        );
-                        flush_transmits(&socket, &mut conn, now).await;
-                        connections.insert(ch, conn);
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "[core {core}] accept from {remote} failed: {}",
-                            e.cause
-                        );
-                        if let Some(t) = e.response {
-                            udp_send(
-                                &socket,
-                                &scratch_buf[..t.size],
-                                t.destination,
-                            )
-                            .await;
-                        }
-                    }
+        if let Some((result, buf)) = received {
+            match result {
+                Ok((0, _)) => {}
+                Ok((n, remote)) => {
+                    let data = BytesMut::from(&buf[..n]);
+                    state.handle_datagram(data, remote, now).await;
                 }
+                Err(e) => log::warn!("[core {core}] UDP recv failed: {e}"),
             }
-            Some(DatagramEvent::ConnectionEvent(ch, event)) => {
-                let Some(conn) = connections.get_mut(&ch) else { continue };
-                conn.handle_event(event);
-                drain_endpoint_events(&mut endpoint, ch, conn);
-                for (id, data) in drain_app_events(core, conn) {
-                    echo(core, conn, id, &data);
-                }
-                flush_transmits(&socket, conn, now).await;
-            }
-            // Stateless reply, e.g. version negotiation.
-            Some(DatagramEvent::Response(t)) => {
-                udp_send(&socket, &scratch_buf[..t.size], t.destination).await;
-            }
-            None => {}
+            recv.set(socket.recv_from(buf));
         }
-        scratch_buf.clear();
+        state.handle_timeouts(now).await;
     }
 }
 
@@ -205,7 +301,6 @@ fn drain_app_events(
                 log::debug!("[core {core}] handshake complete");
                 continue;
             }
-            // The connection is never removed from `connections`.
             Event::ConnectionLost { reason } => {
                 log::debug!("[core {core}] connection lost: {reason}");
                 continue;

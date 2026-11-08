@@ -20,7 +20,7 @@ anyhow = "1"
 
 [dev-dependencies]
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log", "bloom"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
 
 [profile.release]
 debug = 1
