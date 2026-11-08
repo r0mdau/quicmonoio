@@ -1,15 +1,16 @@
 SHELL := /bin/bash
 
-SERVER := target/release/quicmonoio
-CLIENT := target/release/quic_client
+PROFILE ?= release
+SERVER := target/$(PROFILE)/quicmonoio
+CLIENT := target/$(PROFILE)/examples/quic_client
 
 .PHONY: all build run client test clean
 
 all: build
 
-## build: compile server and client in release mode
+## build: compile server and client (PROFILE=release by default)
 build:
-	cargo build --release
+	cargo build --profile $(PROFILE) --bins --examples
 
 ## run: start the server (HTTP :8080, QUIC :4433)
 run: build
@@ -21,7 +22,7 @@ client: build
 
 ## test: cargo tests + end-to-end check (HTTP and QUIC) against a fresh server
 test: build
-	cargo test --release
+	cargo test --profile $(PROFILE)
 	@set -e; \
 	$(SERVER) > /dev/null 2>&1 & pid=$$!; \
 	trap 'kill $$pid 2>/dev/null' EXIT; \
