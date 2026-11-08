@@ -4,21 +4,26 @@
 use std::{
     collections::{BTreeSet, HashMap},
     net::SocketAddr,
+    ops::{Deref, DerefMut},
     path::Path,
     pin::pin,
+    slice,
     sync::Arc,
     time::Instant,
 };
 
 use anyhow::Context;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use monoio::{net::udp::UdpSocket, time::timeout_at};
 use quinn_proto::{
     self as quinn, ConnectionHandle, DatagramEvent, Dir, Endpoint,
-    EndpointConfig, Event, Incoming, ServerConfig, StreamEvent, StreamId,
+    EndpointConfig, Event, Incoming, ReadError, ServerConfig, StreamEvent,
+    StreamId, VarInt, WriteError,
 };
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+
+const MAX_CHUNK: usize = 64 * 1024;
 
 /// Builds the config shared by all cores, with a fresh self-signed cert
 /// written to `cert_path` for the test client.
@@ -87,7 +92,7 @@ async fn flush_transmits(
 }
 
 struct TrackedConnection {
-    conn: quinn::Connection,
+    conn: EchoConnection,
     deadline: Option<Instant>,
 }
 
@@ -148,6 +153,7 @@ impl QuicCore<'_> {
         {
             Ok((ch, conn)) => {
                 log::debug!("[core {core}] new connection from {remote}");
+                let conn = EchoConnection::new(conn);
                 self.connections
                     .insert(ch, TrackedConnection { conn, deadline: None });
                 self.drive(ch, now, |_| {}).await;
@@ -188,9 +194,7 @@ impl QuicCore<'_> {
         let conn = &mut tracked.conn;
         update(conn);
         drain_endpoint_events(&mut self.endpoint, ch, conn);
-        for (id, data) in drain_app_events(core, conn) {
-            echo(core, conn, id, &data);
-        }
+        conn.drain_app_events(core);
         flush_transmits(self.socket, conn, now).await;
 
         if let Some(old) = tracked.deadline.take() {
@@ -257,26 +261,6 @@ pub async fn run_quic_on_core(
     }
 }
 
-/// One write + finish: data arriving later on the stream is not echoed.
-fn echo(core: usize, conn: &mut quinn::Connection, id: StreamId, data: &[u8]) {
-    let mut send = conn.send_stream(id);
-    match send.write(data) {
-        Ok(n) if n == data.len() => {}
-        Ok(n) => log::warn!(
-            "[core {core}] {id}: echo truncated to {n}/{} bytes",
-            data.len()
-        ),
-        Err(e) => {
-            log::warn!("[core {core}] {id}: echo failed: {e}");
-            return;
-        }
-    }
-    if let Err(e) = send.finish() {
-        log::warn!("[core {core}] {id}: finish failed: {e}");
-    }
-    log::debug!("[core {core}] echoed {} bytes on {id}", data.len());
-}
-
 fn drain_endpoint_events(
     endpoint: &mut Endpoint,
     ch: ConnectionHandle,
@@ -289,51 +273,104 @@ fn drain_endpoint_events(
     }
 }
 
-/// Returns the data read from each readable stream.
-fn drain_app_events(
-    core: usize,
-    conn: &mut quinn::Connection,
-) -> Vec<(StreamId, Vec<u8>)> {
-    let mut out = Vec::new();
-    while let Some(event) = conn.poll() {
-        let id = match event {
-            Event::Connected => {
-                log::debug!("[core {core}] handshake complete");
-                continue;
-            }
-            Event::ConnectionLost { reason } => {
-                log::debug!("[core {core}] connection lost: {reason}");
-                continue;
-            }
-            // `Opened` may cover several streams, but only one is accepted per event.
-            Event::Stream(StreamEvent::Opened { dir: Dir::Bi }) => {
-                match conn.streams().accept(Dir::Bi) {
-                    Some(id) => id,
-                    None => continue,
-                }
-            }
-            Event::Stream(StreamEvent::Readable { id }) => id,
-            _ => continue,
-        };
-        let data = read_stream(conn, id);
-        if !data.is_empty() {
-            out.push((id, data));
-        }
-    }
-    out
+/// A connection plus the echo state of its open streams, dropped with it.
+struct EchoConnection {
+    inner: quinn::Connection,
+    /// Bytes read from each open stream and not yet accepted for sending.
+    pending: HashMap<StreamId, Bytes>,
 }
 
-fn read_stream(conn: &mut quinn::Connection, id: StreamId) -> Vec<u8> {
-    let mut data = Vec::new();
-    let mut recv = conn.recv_stream(id);
-    // Errors here are normal stream lifecycle (closed, reset, blocked).
-    let Ok(mut chunks) = recv.read(true) else { return data };
-    while let Ok(Some(chunk)) = chunks.next(usize::MAX) {
-        data.extend_from_slice(&chunk.bytes);
+impl Deref for EchoConnection {
+    type Target = quinn::Connection;
+
+    fn deref(&self) -> &quinn::Connection {
+        &self.inner
     }
-    // Flow-control updates are sent by the caller's flush.
-    let _ = chunks.finalize();
-    data
+}
+
+impl DerefMut for EchoConnection {
+    fn deref_mut(&mut self) -> &mut quinn::Connection {
+        &mut self.inner
+    }
+}
+
+impl EchoConnection {
+    fn new(inner: quinn::Connection) -> EchoConnection {
+        EchoConnection { inner, pending: HashMap::new() }
+    }
+
+    fn drain_app_events(&mut self, core: usize) {
+        while let Some(event) = self.inner.poll() {
+            match event {
+                Event::Connected => {
+                    log::debug!("[core {core}] handshake complete");
+                }
+                Event::ConnectionLost { reason } => {
+                    log::debug!("[core {core}] connection lost: {reason}");
+                    self.pending.clear();
+                }
+                Event::Stream(StreamEvent::Opened { dir: Dir::Bi }) => {
+                    while let Some(id) = self.inner.streams().accept(Dir::Bi) {
+                        self.pending.insert(id, Bytes::new());
+                        self.echo(core, id);
+                    }
+                }
+                Event::Stream(
+                    StreamEvent::Readable { id }
+                    | StreamEvent::Writable { id },
+                ) => self.echo(core, id),
+                Event::Stream(StreamEvent::Stopped { id, error_code }) => {
+                    self.abort(id, error_code);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Echoes `id` until reads or writes block or the stream ends. Reads only
+    /// once `pending` is empty, so unread data stays under flow control.
+    fn echo(&mut self, core: usize, id: StreamId) {
+        let Some(pending) = self.pending.get_mut(&id) else { return };
+        loop {
+            while !pending.is_empty() {
+                let mut send = self.inner.send_stream(id);
+                let code = match send.write_chunks(slice::from_mut(pending)) {
+                    Ok(_) => continue,
+                    Err(WriteError::Blocked) => return,
+                    Err(WriteError::Stopped(code)) => code,
+                    Err(WriteError::ClosedStream) => 0u32.into(),
+                };
+                return self.abort(id, code);
+            }
+
+            let mut recv = self.inner.recv_stream(id);
+            let Ok(mut chunks) = recv.read(true) else {
+                return self.abort(id, 0u32.into());
+            };
+            let chunk = chunks.next(MAX_CHUNK);
+            // Flow-control updates are sent by the caller's flush.
+            let _ = chunks.finalize();
+            match chunk {
+                Ok(Some(chunk)) => *pending = chunk.bytes,
+                Ok(None) => {
+                    self.pending.remove(&id);
+                    if let Err(e) = self.inner.send_stream(id).finish() {
+                        log::debug!("[core {core}] {id}: finish failed: {e}");
+                    }
+                    return;
+                }
+                Err(ReadError::Blocked) => return,
+                Err(ReadError::Reset(code)) => return self.abort(id, code),
+            }
+        }
+    }
+
+    fn abort(&mut self, id: StreamId, code: VarInt) {
+        self.pending.remove(&id);
+        // Either side may already be closed.
+        let _ = self.inner.send_stream(id).reset(code);
+        let _ = self.inner.recv_stream(id).stop(code);
+    }
 }
 
 #[cfg(test)]
