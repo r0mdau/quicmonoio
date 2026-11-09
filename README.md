@@ -101,8 +101,7 @@ The global allocator is [jemalloc](https://github.com/tikv/jemallocator). jemall
 ## Known limitations
 
 - **No connection cap**: a peer with a real address can open many connections until they idle out.
-- **Echo is one-shot**: the server echoes the first read on each stream, then finishes it; partial writes are not retried.
-- **Streams can be missed**: one bidirectional stream is accepted per `Opened` event; unidirectional streams are ignored.
+- **Unidirectional streams are ignored**: only bidirectional QUIC streams are echoed.
 - **Minimal HTTP**: only `GET /` and `GET /health`, always `Connection: close`.
 - **Minimal QUIC I/O**: packets are sent one at a time (no GSO/batching), and a new self-signed certificate is generated on every start.
 

@@ -4,7 +4,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering::SeqCst},
+        atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst},
     },
     time::Duration,
 };
@@ -21,12 +21,13 @@ use crate::{
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn client_endpoint(trusted_cert: Vec<u8>) -> Endpoint {
-    client_endpoint_with_idle(trusted_cert, Duration::from_secs(5))
+    client_endpoint_with(trusted_cert, Duration::from_secs(5), None)
 }
 
-fn client_endpoint_with_idle(
+fn client_endpoint_with(
     trusted_cert: Vec<u8>,
     idle: Duration,
+    window: Option<u32>,
 ) -> Endpoint {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(CertificateDer::from(trusted_cert)).unwrap();
@@ -42,6 +43,9 @@ fn client_endpoint_with_idle(
     // So a stalled connection fails the test instead of hanging it.
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(idle.try_into().unwrap()));
+    if let Some(window) = window {
+        transport.stream_receive_window(window.into());
+    }
     config.transport_config(Arc::new(transport));
 
     let mut endpoint =
@@ -56,9 +60,15 @@ async fn connect(endpoint: &Endpoint, addr: SocketAddr) -> Connection {
 
 async fn echo_on(conn: &Connection, message: &[u8]) -> Vec<u8> {
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
-    send.write_all(message).await.unwrap();
-    send.finish().unwrap();
-    recv.read_to_end(64 * 1024).await.expect("read echo")
+    // Concurrent: a peer that writes everything first can deadlock an echo.
+    let (_, read) = tokio::join!(
+        async {
+            send.write_all(message).await.unwrap();
+            send.finish().unwrap();
+        },
+        recv.read_to_end(2 * message.len()),
+    );
+    read.expect("read echo")
 }
 
 async fn echo(
@@ -122,6 +132,96 @@ async fn quic_echo_concurrent_connections() {
     endpoint.wait_idle().await;
 }
 
+fn pattern(len: usize, seed: u8) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8 ^ seed).collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quic_echo_1mib_is_byte_identical() {
+    let server = Server::start("quic_echo_1mib_is_byte_identical");
+    // Smaller than the message, so the server has to retry blocked writes.
+    let endpoint = client_endpoint_with(
+        std::fs::read(server.cert_path()).unwrap(),
+        Duration::from_secs(5),
+        Some(64 * 1024),
+    );
+    let conn = connect(&endpoint, server.quic_addr()).await;
+
+    let message = pattern(1 << 20, 0);
+    let reply = echo_on(&conn, &message).await;
+    assert!(reply == message, "echo differs from the 1 MiB message");
+
+    conn.close(0u32.into(), b"done");
+    endpoint.wait_idle().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quic_echo_many_streams_on_one_connection() {
+    let server = Server::start("quic_echo_many_streams_on_one_connection");
+    let endpoint = client_endpoint(std::fs::read(server.cert_path()).unwrap());
+    let conn = connect(&endpoint, server.quic_addr()).await;
+
+    // More than the default limit of 100 concurrent streams.
+    let tasks: Vec<_> = (0..250usize)
+        .map(|i| {
+            let conn = conn.clone();
+            tokio::spawn(async move {
+                let message = pattern(1 + i * 64, i as u8);
+                let reply = echo_on(&conn, &message).await;
+                assert!(reply == message, "stream #{i} differs");
+            })
+        })
+        .collect();
+    for task in tasks {
+        task.await.unwrap();
+    }
+
+    conn.close(0u32.into(), b"done");
+    endpoint.wait_idle().await;
+}
+
+#[tokio::test]
+async fn quic_stream_reset_leaves_connection_usable() {
+    let server = Server::start("quic_stream_reset_leaves_connection_usable");
+    let endpoint = client_endpoint(std::fs::read(server.cert_path()).unwrap());
+    let conn = connect(&endpoint, server.quic_addr()).await;
+
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    send.write_all(b"abandoned").await.unwrap();
+    let mut buf = [0u8; 9];
+    recv.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"abandoned");
+    send.reset(7u32.into()).unwrap();
+    let err = recv.read_to_end(64).await.expect_err("stream was reset");
+    assert_eq!(
+        err,
+        quinn::ReadToEndError::Read(quinn::ReadError::Reset(7u32.into()))
+    );
+
+    assert_eq!(echo_on(&conn, b"still alive").await, b"still alive");
+
+    conn.close(0u32.into(), b"done");
+    endpoint.wait_idle().await;
+}
+
+#[tokio::test]
+async fn quic_removes_connection_with_open_stream() {
+    let server = Server::start("quic_removes_connection_with_open_stream");
+    let endpoint = client_endpoint(std::fs::read(server.cert_path()).unwrap());
+    let conn = connect(&endpoint, server.quic_addr()).await;
+
+    // No FIN: the server still tracks this stream when the connection closes.
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    send.write_all(b"open").await.unwrap();
+    let mut buf = [0u8; 4];
+    recv.read_exact(&mut buf).await.unwrap();
+
+    conn.close(0u32.into(), b"done");
+    wait_for_log(&server, "connection removed").await;
+    assert_eq!(echo(&endpoint, server.quic_addr(), b"next").await, b"next");
+    endpoint.wait_idle().await;
+}
+
 #[tokio::test]
 async fn quic_rejects_untrusted_cert() {
     let server = Server::start("quic_rejects_untrusted_cert");
@@ -167,11 +267,40 @@ async fn quic_retransmits_lost_echo() {
     assert_eq!(to_drop.load(SeqCst), 0, "no echo was lost");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quic_echo_resumes_through_periodic_loss() {
+    const DROP_EVERY: usize = 20;
+
+    let server = Server::start("quic_echo_resumes_through_periodic_loss");
+    let lossy = Arc::new(AtomicBool::new(false));
+    let to_client = Arc::new(AtomicUsize::new(0));
+    let proxy = {
+        let (lossy, to_client) = (lossy.clone(), to_client.clone());
+        LossyProxy::start(server.quic_addr(), move |dir, _| {
+            dir != Direction::ToClient
+                || !lossy.load(SeqCst)
+                || (to_client.fetch_add(1, SeqCst) + 1) % DROP_EVERY != 0
+        })
+        .await
+    };
+    let endpoint = client_endpoint(std::fs::read(server.cert_path()).unwrap());
+
+    let conn = connect(&endpoint, proxy.addr()).await;
+    lossy.store(true, SeqCst);
+    let message = pattern(256 * 1024, 0);
+    let reply = timeout(TEST_TIMEOUT, echo_on(&conn, &message))
+        .await
+        .expect("echo stalled under loss");
+
+    assert!(reply == message, "echo differs from the message");
+    assert!(to_client.load(SeqCst) >= DROP_EVERY, "no datagram was lost");
+}
+
 #[tokio::test]
 async fn quic_removes_idle_connection() {
     let server = Server::start("quic_removes_idle_connection");
     let cert = std::fs::read(server.cert_path()).unwrap();
-    let endpoint = client_endpoint_with_idle(cert, Duration::from_secs(1));
+    let endpoint = client_endpoint_with(cert, Duration::from_secs(1), None);
 
     // Kept open without a close: only the idle timer can remove it.
     let conn = connect(&endpoint, server.quic_addr()).await;
