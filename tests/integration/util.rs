@@ -70,6 +70,7 @@ pub struct ServerCommand {
     http_addr: SocketAddr,
     quic_addr: SocketAddr,
     cert_path: PathBuf,
+    shutdown_grace: Option<u64>,
 }
 
 impl ServerCommand {
@@ -81,7 +82,13 @@ impl ServerCommand {
             http_addr: free_addr(false),
             quic_addr: free_addr(true),
             cert_path,
+            shutdown_grace: None,
         }
+    }
+
+    pub fn shutdown_grace(mut self, seconds: u64) -> Self {
+        self.shutdown_grace = Some(seconds);
+        self
     }
 
     pub fn http_addr(mut self, addr: SocketAddr) -> Self {
@@ -114,6 +121,9 @@ impl ServerCommand {
             .min(2);
         let stderr = File::create(self.stderr_path())
             .expect("failed to create stderr log");
+        let grace_args = self.shutdown_grace.iter().flat_map(|seconds| {
+            ["--shutdown-grace".to_owned(), seconds.to_string()]
+        });
         let child = bin()
             .current_dir(self.dir())
             .env("RUST_LOG", "debug")
@@ -125,6 +135,7 @@ impl ServerCommand {
             .arg(&self.cert_path)
             .arg("--threads")
             .arg(threads.to_string())
+            .args(grace_args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(stderr)
@@ -181,6 +192,21 @@ impl Server {
         http_get(self.http_addr(), path).unwrap_or_else(|e| {
             panic!("GET {path} failed: {e}\nserver stderr:\n{}", self.stderr())
         })
+    }
+
+    pub fn signal(&self, name: &str) {
+        let status = Command::new("kill")
+            .arg(format!("-{name}"))
+            .arg(self.child.id().to_string())
+            .status()
+            .expect("failed to run kill");
+        assert!(status.success(), "kill -{name} failed: {status}");
+    }
+
+    pub fn wait_for_stderr(&mut self, needle: &str) {
+        self.poll_until("log line missing", |server| {
+            server.stderr().contains(needle).then_some(())
+        });
     }
 
     pub fn wait_exit(mut self) -> (ExitStatus, String) {

@@ -7,10 +7,12 @@ use std::{
     net::SocketAddr,
     num::NonZeroUsize,
     panic::{self, AssertUnwindSafe},
+    pin::pin,
     process::ExitCode,
+    rc::Rc,
     sync::{Arc, Barrier, mpsc},
     thread::{self, available_parallelism},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, bail};
@@ -26,14 +28,17 @@ use monoio::{
 
 mod cli;
 mod quic;
+mod shutdown;
 
 use cli::Config;
+use shutdown::Shutdown;
 
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_HEAD_SIZE: usize = 8 * 1024;
 const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(5);
 const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+const DRAIN_POLL: Duration = Duration::from_millis(10);
 const BAD_REQUEST: &str = "400 Bad Request";
 const HEAD_TOO_LARGE: &str = "431 Request Header Fields Too Large";
 
@@ -60,16 +65,18 @@ fn run(config: Config) -> anyhow::Result<()> {
         "Starting {thread_count} cores: HTTP on {http_addr}, QUIC on {quic_addr}"
     );
 
+    let shutdown =
+        Shutdown::listen(Duration::from_secs(config.shutdown_grace))?;
+
     // One cert for all cores: the kernel may route a client to any of them.
     let quic_config = quic::make_server_config(&config.cert_path)?;
 
-    // Cores serve forever, so the first one to report back (error or panic)
-    // is fatal.
     let (tx, rx) = mpsc::channel();
     let all_bound = Arc::new(Barrier::new(thread_count));
     for core in 0..thread_count {
         let (quic_config, all_bound, tx) =
             (quic_config.clone(), all_bound.clone(), tx.clone());
+        let shutdown = shutdown.try_clone()?;
         thread::Builder::new()
             .name(format!("core-{core}"))
             .spawn(move || {
@@ -80,6 +87,7 @@ fn run(config: Config) -> anyhow::Result<()> {
                         quic_addr,
                         quic_config,
                         all_bound,
+                        shutdown,
                     )
                 }));
                 let _ = tx.send((core, res));
@@ -90,12 +98,18 @@ fn run(config: Config) -> anyhow::Result<()> {
     }
     drop(tx);
 
-    let (core, res) = rx.recv().context("all cores stopped")?;
-    match res {
-        Ok(Ok(())) => bail!("core {core} stopped unexpectedly"),
-        Ok(Err(err)) => Err(err.context(format!("core {core} failed"))),
-        Err(_) => bail!("core {core} panicked"),
+    // Cores only return Ok after shutdown; any error or panic is fatal.
+    for (core, res) in rx.iter().take(thread_count) {
+        match res {
+            Ok(Ok(())) => log::debug!("core {core} stopped"),
+            Ok(Err(err)) => {
+                return Err(err.context(format!("core {core} failed")));
+            }
+            Err(_) => bail!("core {core} panicked"),
+        }
     }
+    log::info!("Shutdown complete");
+    Ok(())
 }
 
 fn run_core(
@@ -104,6 +118,7 @@ fn run_core(
     quic_addr: SocketAddr,
     quic_config: Arc<quinn_proto::ServerConfig>,
     all_bound: Arc<Barrier>,
+    shutdown: Shutdown,
 ) -> anyhow::Result<()> {
     bind_to_cpu_set([core])
         .with_context(|| format!("failed to pin thread to CPU {core}"))?;
@@ -111,7 +126,14 @@ fn run_core(
         .enable_timer()
         .build()
         .context("failed to build io_uring runtime")?
-        .block_on(serve(core, http_addr, quic_addr, quic_config, all_bound))
+        .block_on(serve(
+            core,
+            http_addr,
+            quic_addr,
+            quic_config,
+            all_bound,
+            shutdown,
+        ))
 }
 
 async fn serve(
@@ -120,6 +142,7 @@ async fn serve(
     quic_addr: SocketAddr,
     quic_config: Arc<quinn_proto::ServerConfig>,
     all_bound: Arc<Barrier>,
+    shutdown: Shutdown,
 ) -> anyhow::Result<()> {
     let quic_socket = quic::bind_udp_socket(quic_addr)?;
     let opts = ListenerOpts::default().reuse_port(true).reuse_addr(true);
@@ -130,26 +153,74 @@ async fn serve(
 
     // A core joining the SO_REUSEPORT groups later would move live flows.
     all_bound.wait();
-    monoio::spawn(quic::run_quic_on_core(core, quic_config, quic_socket));
 
+    let quic_shutdown = shutdown.try_clone()?;
+    monoio::try_join!(
+        quic::run_quic_on_core(core, quic_config, quic_socket, quic_shutdown),
+        serve_http(core, listener, shutdown),
+    )?;
+    Ok(())
+}
+
+async fn serve_http(
+    core: usize,
+    listener: TcpListener,
+    shutdown: Shutdown,
+) -> anyhow::Result<()> {
+    let grace = shutdown.grace();
+    let mut requested = pin!(shutdown.requested());
+    let in_flight = Rc::new(());
     let mut backoff = Duration::ZERO;
     loop {
-        match listener.accept().await {
-            Ok((stream, addr)) => {
-                backoff = Duration::ZERO;
+        monoio::select! {
+            res = &mut requested => {
+                res.context("failed to watch for shutdown")?;
+                break;
+            }
+            accepted = accept(core, &listener, &mut backoff) => {
+                let Some((stream, addr)) = accepted else { continue };
+                let guard = in_flight.clone();
                 monoio::spawn(async move {
+                    let _guard = guard;
                     if let Err(e) = handle_connection(stream).await {
                         log::warn!("[core {core}] {addr}: {e}");
                     }
                 });
             }
-            Err(e) => {
-                backoff = next_accept_backoff(backoff);
-                log::warn!(
-                    "[core {core}] accept failed, retrying in {backoff:?}: {e}"
-                );
-                sleep(backoff).await;
-            }
+        }
+    }
+    drop(listener);
+
+    let deadline = Instant::now() + grace;
+    while Rc::strong_count(&in_flight) > 1 && Instant::now() < deadline {
+        sleep(DRAIN_POLL).await;
+    }
+    let abandoned = Rc::strong_count(&in_flight) - 1;
+    if abandoned > 0 {
+        log::warn!(
+            "[core {core}] abandoning {abandoned} HTTP connections at the shutdown deadline"
+        );
+    }
+    Ok(())
+}
+
+async fn accept(
+    core: usize,
+    listener: &TcpListener,
+    backoff: &mut Duration,
+) -> Option<(TcpStream, SocketAddr)> {
+    match listener.accept().await {
+        Ok(accepted) => {
+            *backoff = Duration::ZERO;
+            Some(accepted)
+        }
+        Err(e) => {
+            *backoff = next_accept_backoff(*backoff);
+            log::warn!(
+                "[core {core}] accept failed, retrying in {backoff:?}: {e}"
+            );
+            sleep(*backoff).await;
+            None
         }
     }
 }

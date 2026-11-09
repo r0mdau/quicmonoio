@@ -3,13 +3,14 @@
 
 use std::{
     collections::{BTreeSet, HashMap},
+    future::Future,
     net::SocketAddr,
     ops::{Deref, DerefMut},
     path::Path,
-    pin::pin,
+    pin::{Pin, pin},
     slice,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::Context;
@@ -23,7 +24,11 @@ use quinn_proto::{
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 
+use crate::shutdown::Shutdown;
+
 const MAX_CHUNK: usize = 64 * 1024;
+const CLOSE_LINGER: Duration = Duration::from_secs(1);
+const SHUTDOWN_REASON: &[u8] = b"shutting down";
 
 /// Builds the config shared by all cores, with a fresh self-signed cert
 /// written to `cert_path` for the test client.
@@ -103,6 +108,23 @@ struct QuicCore<'a> {
     connections: HashMap<ConnectionHandle, TrackedConnection>,
     deadlines: BTreeSet<(Instant, ConnectionHandle)>,
     scratch_buf: Vec<u8>,
+    draining: bool,
+}
+
+#[derive(Clone, Copy)]
+enum Phase {
+    Serving,
+    Draining(Instant),
+    Closing(Instant),
+}
+
+impl Phase {
+    fn deadline(self) -> Option<Instant> {
+        match self {
+            Phase::Serving => None,
+            Phase::Draining(at) | Phase::Closing(at) => Some(at),
+        }
+    }
 }
 
 impl QuicCore<'_> {
@@ -142,6 +164,11 @@ impl QuicCore<'_> {
     async fn handle_incoming(&mut self, incoming: Incoming, now: Instant) {
         let core = self.core;
         let remote = incoming.remote_address();
+        if self.draining {
+            let t = self.endpoint.refuse(incoming, &mut self.scratch_buf);
+            self.send_scratch(t).await;
+            return;
+        }
         if !incoming.remote_address_validated() {
             match self.endpoint.retry(incoming, &mut self.scratch_buf) {
                 Ok(t) => self.send_scratch(t).await,
@@ -182,6 +209,17 @@ impl QuicCore<'_> {
         }
     }
 
+    async fn drive_all(
+        &mut self,
+        now: Instant,
+        update: impl Fn(&mut quinn::Connection) + Copy,
+    ) {
+        let handles: Vec<_> = self.connections.keys().copied().collect();
+        for ch in handles {
+            self.drive(ch, now, update).await;
+        }
+    }
+
     /// Every change to a connection's state must go through here.
     async fn drive(
         &mut self,
@@ -195,6 +233,12 @@ impl QuicCore<'_> {
         update(conn);
         drain_endpoint_events(&mut self.endpoint, ch, conn);
         conn.drain_app_events(core);
+        if self.draining
+            && !conn.is_closed()
+            && conn.streams().send_streams() == 0
+        {
+            close_for_shutdown(conn, now);
+        }
         flush_transmits(self.socket, conn, now).await;
 
         if let Some(old) = tracked.deadline.take() {
@@ -219,7 +263,8 @@ pub async fn run_quic_on_core(
     core: usize,
     server_config: Arc<ServerConfig>,
     socket: UdpSocket,
-) {
+    shutdown: Shutdown,
+) -> anyhow::Result<()> {
     let mut state = QuicCore {
         core,
         socket: &socket,
@@ -232,17 +277,29 @@ pub async fn run_quic_on_core(
         connections: HashMap::new(),
         deadlines: BTreeSet::new(),
         scratch_buf: Vec::new(),
+        draining: false,
     };
     // monoio moves the buffer into the operation and hands it back with the
     // result, so this future lives across timer wakeups.
     let mut recv = pin!(socket.recv_from(vec![0u8; 65536]));
+    let grace = shutdown.grace();
+    let mut requested = pin!(shutdown.requested());
+    let mut phase = Phase::Serving;
 
     loop {
-        let received = match state.deadlines.first() {
-            Some(&(deadline, _)) => {
-                timeout_at(deadline.into(), recv.as_mut()).await.ok()
+        let next_timer =
+            state.deadlines.first().map(|&(deadline, _)| deadline);
+        let wake_at = next_timer.into_iter().chain(phase.deadline()).min();
+        let received = monoio::select! {
+            res = &mut requested, if matches!(phase, Phase::Serving) => {
+                res.context("failed to watch for shutdown")?;
+                let now = Instant::now();
+                state.draining = true;
+                state.drive_all(now, |_| {}).await;
+                phase = Phase::Draining(now + grace);
+                None
             }
-            None => Some(recv.as_mut().await),
+            received = recv_until(recv.as_mut(), wake_at) => received,
         };
         let now = Instant::now();
 
@@ -258,7 +315,40 @@ pub async fn run_quic_on_core(
             recv.set(socket.recv_from(buf));
         }
         state.handle_timeouts(now).await;
+
+        match phase {
+            Phase::Draining(deadline) if now >= deadline => {
+                if !state.connections.is_empty() {
+                    log::warn!(
+                        "[core {core}] closing {} QUIC connections at the shutdown deadline",
+                        state.connections.len()
+                    );
+                }
+                state.drive_all(now, |c| close_for_shutdown(c, now)).await;
+                phase = Phase::Closing(now + CLOSE_LINGER);
+            }
+            Phase::Closing(deadline) if now >= deadline => break,
+            _ => {}
+        }
+        if phase.deadline().is_some() && state.connections.is_empty() {
+            break;
+        }
     }
+    Ok(())
+}
+
+async fn recv_until<F: Future>(
+    recv: Pin<&mut F>,
+    at: Option<Instant>,
+) -> Option<F::Output> {
+    match at {
+        Some(at) => timeout_at(at.into(), recv).await.ok(),
+        None => Some(recv.await),
+    }
+}
+
+fn close_for_shutdown(conn: &mut quinn::Connection, now: Instant) {
+    conn.close(now, VarInt::from_u32(0), Bytes::from_static(SHUTDOWN_REASON));
 }
 
 fn drain_endpoint_events(
