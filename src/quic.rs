@@ -295,6 +295,7 @@ pub async fn run_quic_on_core(
                 res.context("failed to watch for shutdown")?;
                 let now = Instant::now();
                 state.draining = true;
+                log::info!("[core {core}] draining QUIC connections");
                 state.drive_all(now, |_| {}).await;
                 phase = Phase::Draining(now + grace);
                 None

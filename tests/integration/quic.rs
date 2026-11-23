@@ -375,7 +375,13 @@ async fn quic_refuses_new_connections_while_draining() {
     assert!(wait_until(|| echo_sent.load(SeqCst)).await, "no echo sent");
 
     server.signal("TERM");
-    wait_for_log(&server, "shutting down").await;
+    // Only every core's own log line proves it refuses new connections.
+    let all_draining = wait_until(|| {
+        server.stderr().matches("draining QUIC connections").count()
+            == server.threads()
+    })
+    .await;
+    assert!(all_draining, "not every core draining:\n{}", server.stderr());
 
     let error = endpoint
         .connect(server.quic_addr(), "localhost")

@@ -141,7 +141,7 @@ impl ServerCommand {
             .stderr(stderr)
             .spawn()
             .expect("failed to spawn quicmonoio");
-        Server { child, cmd: self }
+        Server { child, cmd: self, threads }
     }
 
     pub fn start(self) -> Server {
@@ -165,11 +165,16 @@ impl ServerCommand {
 pub struct Server {
     child: Child,
     cmd: ServerCommand,
+    threads: usize,
 }
 
 impl Server {
     pub fn start(test_name: &str) -> Server {
         ServerCommand::new(test_name).start()
+    }
+
+    pub fn threads(&self) -> usize {
+        self.threads
     }
 
     pub fn http_addr(&self) -> SocketAddr {
