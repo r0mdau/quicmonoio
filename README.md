@@ -30,6 +30,7 @@ cargo run -- --help         # flags
 | `--quic-addr` | `0.0.0.0:4433` | QUIC listen address |
 | `--cert-path` | `./.test-cert.der` | where the self-signed cert is written |
 | `--threads` | available parallelism | cores, pinned to CPUs `0..N` |
+| `--shutdown-grace` | `10` | seconds to let in-flight work finish after SIGTERM/SIGINT |
 
 ### 2. Test HTTP
 
@@ -79,7 +80,13 @@ make clean              # cargo clean + remove the generated cert
 - Every core binds the HTTP (TCP) and QUIC (UDP) addresses with `SO_REUSEPORT`, and the kernel spreads incoming traffic across them.
 - On the server, QUIC runs on `quinn-proto`, a runtime-agnostic state machine, driven entirely by monoio's event loop. The server does not use tokio; only the test client does.
 - Logs go to stderr via `env_logger`; `RUST_LOG` sets the level (default `info`).
-- Cores are meant to run forever. If one fails to start (e.g. a port is taken) or panics, the server prints the error and exits non-zero.
+- If a core fails to start (e.g. a port is taken) or panics, the server prints the error and exits non-zero.
+
+## Graceful shutdown
+
+On SIGTERM or SIGINT every core closes its HTTP listener, refuses new QUIC connections and finishes in-flight work for up to `--shutdown-grace` seconds, then the server exits 0. QUIC connections close once their data is acknowledged, or at the deadline.
+
+A second signal exits immediately with status 143. If a core hangs, a watchdog exits with status 1 three seconds after the deadline.
 
 ## Design: why run both protocols on every core?
 

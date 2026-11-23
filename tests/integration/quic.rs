@@ -9,13 +9,16 @@ use std::{
     time::Duration,
 };
 
-use quinn::{Connection, Endpoint, crypto::rustls::QuicClientConfig};
+use quinn::{
+    Connection, ConnectionError, Endpoint, TransportErrorCode,
+    crypto::rustls::QuicClientConfig,
+};
 use rustls::pki_types::CertificateDer;
 use tokio::time::{sleep, timeout};
 
 use crate::{
     proxy::{Direction, LossyProxy},
-    util::Server,
+    util::{Server, ServerCommand},
 };
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -317,6 +320,81 @@ async fn quic_removes_closed_connection_and_keeps_serving() {
     wait_for_log(&server, "connection removed").await;
     assert_eq!(echo(&endpoint, server.quic_addr(), b"two").await, b"two");
     endpoint.wait_idle().await;
+}
+
+#[tokio::test]
+async fn quic_connection_is_closed_on_shutdown() {
+    let server = Server::start("quic_connection_is_closed_on_shutdown");
+    let endpoint = client_endpoint(std::fs::read(server.cert_path()).unwrap());
+    let conn = connect(&endpoint, server.quic_addr()).await;
+    assert_eq!(echo_on(&conn, b"bye").await, b"bye");
+
+    server.signal("TERM");
+    let error = timeout(TEST_TIMEOUT, conn.closed()).await.unwrap();
+
+    match error {
+        ConnectionError::ApplicationClosed(close) => {
+            assert_eq!(&close.reason[..], b"shutting down");
+        }
+        other => panic!("unexpected close: {other}"),
+    }
+    let (status, stderr) = server.wait_exit();
+    assert!(status.success(), "{status}\n{stderr}");
+}
+
+#[tokio::test]
+async fn quic_refuses_new_connections_while_draining() {
+    const MESSAGE: [u8; 1000] = [b'x'; 1000];
+
+    let server = ServerCommand::new("quic_refuses_new_connections")
+        .shutdown_grace(2)
+        .start();
+    let blackhole = Arc::new(AtomicBool::new(false));
+    let echo_sent = Arc::new(AtomicBool::new(false));
+    let proxy = {
+        let (blackhole, echo_sent) = (blackhole.clone(), echo_sent.clone());
+        LossyProxy::start(server.quic_addr(), move |dir, datagram| {
+            if dir == Direction::ToServer || !blackhole.load(SeqCst) {
+                return true;
+            }
+            if (MESSAGE.len()..MESSAGE.len() + 100).contains(&datagram.len()) {
+                echo_sent.store(true, SeqCst);
+            }
+            false
+        })
+        .await
+    };
+    let endpoint = client_endpoint(std::fs::read(server.cert_path()).unwrap());
+
+    // The echo can never be acknowledged, so the connection keeps draining.
+    let conn = connect(&endpoint, proxy.addr()).await;
+    blackhole.store(true, SeqCst);
+    let (mut send, _recv) = conn.open_bi().await.unwrap();
+    send.write_all(&MESSAGE).await.unwrap();
+    send.finish().unwrap();
+    assert!(wait_until(|| echo_sent.load(SeqCst)).await, "no echo sent");
+
+    server.signal("TERM");
+    wait_for_log(&server, "shutting down").await;
+
+    let error = endpoint
+        .connect(server.quic_addr(), "localhost")
+        .unwrap()
+        .await
+        .expect_err("connected while draining");
+    match error {
+        ConnectionError::ConnectionClosed(close) => {
+            assert_eq!(
+                close.error_code,
+                TransportErrorCode::CONNECTION_REFUSED
+            );
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+
+    let (status, stderr) = server.wait_exit();
+    assert!(status.success(), "{status}\n{stderr}");
+    assert!(stderr.contains("closing 1 QUIC connections"), "{stderr}");
 }
 
 #[tokio::test]
